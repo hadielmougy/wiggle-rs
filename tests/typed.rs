@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use wiggle::{FlowSpec, RetryPolicy, StepError, Wiggle};
+use wiggle::{FlowSpec, GraphBuilder, RetryPolicy, StepError, Wiggle};
 
 #[derive(Serialize, Deserialize)]
 struct Trip {
@@ -72,7 +72,7 @@ fn by_name<'a>(nodes: &'a HashMap<String, Value>, name: &str) -> &'a Value {
 
 #[test]
 fn all_of_compiles_to_a_fork_rejoined_at_its_combine() {
-    let flow = Wiggle::define("trip", 1, |f| {
+    let flow = FlowSpec::define("trip", 1, |f| {
         let prepped = f.then_apply(prep);
         // continuing `prepped` twice is the fan-out
         let air = prepped.then_apply(book_air);
@@ -103,14 +103,14 @@ fn all_of_compiles_to_a_fork_rejoined_at_its_combine() {
 
 #[test]
 fn same_definition_as_the_builder() {
-    let typed = Wiggle::define("trip", 1, |f| {
+    let typed = FlowSpec::define("trip", 1, |f| {
         let prepped = f.then_apply(prep).queue("q1").retry(RetryPolicy::none());
         let air = prepped.then_apply(book_air);
         let hotel = prepped.then_apply(book_hotel).then_sleep(Duration::from_secs(1)).then_filter(has_room);
         Wiggle::all_of((air, hotel)).combine(merge).then_apply(book)
     })
     .unwrap();
-    let built = FlowSpec::define("trip", 1)
+    let built = GraphBuilder::define("trip", 1)
         .step("prep")
         .queue("q1")
         .retry(RetryPolicy::none())
@@ -127,7 +127,7 @@ fn same_definition_as_the_builder() {
 
 #[test]
 fn one_of_compiles_to_a_choice() {
-    let flow = Wiggle::define("route", 1, |f| {
+    let flow = FlowSpec::define("route", 1, |f| {
         let vip = f.when(is_vip).then_apply(vip_path);
         let standard = f.otherwise().then_apply(standard_path);
         Wiggle::one_of(vec![vip, standard]).then_accept(notify)
@@ -146,7 +146,7 @@ fn one_of_compiles_to_a_choice() {
 
 #[test]
 fn a_single_guarded_arm_is_skipped_when_it_does_not_hold() {
-    let flow = Wiggle::define("route", 1, |f| {
+    let flow = FlowSpec::define("route", 1, |f| {
         let vip = f.when(is_vip).then_apply(vip_path);
         Wiggle::one_of(vec![vip]).then_accept(notify)
     })
@@ -172,7 +172,7 @@ fn for_each_loops_and_compensation() {
     async fn reserve(v: Value) -> R<Value> {
         Ok(v)
     }
-    let flow = Wiggle::define("basket", 1, |f: wiggle::WiggleFlow<Value>| {
+    let flow = FlowSpec::define("basket", 1, |f: wiggle::WiggleFlow<Value>| {
         f.then_apply_compensable(reserve, release)
             .then_for_each("lines", |item| item.then_apply(price))
             .combine(total)
@@ -189,20 +189,43 @@ fn for_each_loops_and_compensation() {
 }
 
 #[test]
+fn workflow_defaults_match_the_builder() {
+    let retry = RetryPolicy::fixed(4, Duration::from_millis(250));
+    let typed = FlowSpec::define_with_retry("trip", 1, retry, |f| {
+        f.default_queue("trips").then_apply(prep).as_type::<Value>().then_apply(book).queue("bookings")
+    })
+    .unwrap();
+    let built = GraphBuilder::define("trip", 1)
+        .default_queue("trips")
+        .default_retry(retry)
+        .step("prep")
+        .step("book")
+        .queue("bookings")
+        .build()
+        .unwrap();
+    assert_eq!(typed.definition(), built.definition());
+    assert_eq!(typed.queues(), ["bookings", "trips"]);
+    assert!(built.steps().is_empty(), "a builder spec carries no handlers");
+
+    let err = FlowSpec::define("trip", 1, |f| f.then_apply(prep).default_queue("late")).unwrap_err();
+    assert!(err.to_string().contains("default_queue()"), "{err}");
+}
+
+#[test]
 fn closures_take_their_name_from_named() {
-    let flow = Wiggle::define("c", 1, |f| {
+    let flow = FlowSpec::define("c", 1, |f| {
         f.then_filter(|t: Trip| async move { Ok(!t.id.is_empty()) }).named("in-stock")
     })
     .unwrap();
     assert_eq!(by_name(&nodes(&flow), "in-stock")["kind"], "PREDICATE");
 
-    let err = Wiggle::define("c", 1, |f| f.then_apply(|t: Trip| async move { Ok(t) })).unwrap_err();
+    let err = FlowSpec::define("c", 1, |f| f.then_apply(|t: Trip| async move { Ok(t) })).unwrap_err();
     assert!(err.to_string().contains("named("), "{err}");
 }
 
 #[test]
 fn a_split_that_is_never_combined_is_rejected_and_names_both_ends() {
-    let err = Wiggle::define("split", 1, |f| {
+    let err = FlowSpec::define("split", 1, |f| {
         let start = f.then_apply(prep);
         start.then_apply(vip_path);
         start.then_apply(standard_path)
@@ -216,7 +239,7 @@ fn a_split_that_is_never_combined_is_rejected_and_names_both_ends() {
 
 #[test]
 fn a_fan_out_with_no_combine_is_rejected() {
-    let err = Wiggle::define("nocombine", 1, |f| {
+    let err = FlowSpec::define("nocombine", 1, |f| {
         let p = f.then_apply(prep);
         let _ = Wiggle::all_of((p.then_apply(book_air), p.then_apply(book_hotel)));
         p
@@ -228,7 +251,7 @@ fn a_fan_out_with_no_combine_is_rejected() {
 
 #[test]
 fn arms_must_be_distinguishable() {
-    let err = Wiggle::define("sleepy", 1, |f| {
+    let err = FlowSpec::define("sleepy", 1, |f| {
         let p = f.then_apply(prep);
         let a = p.then_apply(vip_path).then_sleep(Duration::from_secs(1));
         let b = p.then_apply(standard_path).then_sleep(Duration::from_secs(1));
@@ -245,7 +268,7 @@ fn arms_must_be_distinguishable() {
 
 #[test]
 fn arms_must_be_siblings_and_from_one_definition() {
-    let err = Wiggle::define("anc", 1, |f| {
+    let err = FlowSpec::define("anc", 1, |f| {
         let p = f.then_apply(prep);
         let deeper = p.then_apply(vip_path);
         Wiggle::all_of((p, deeper)).combine(merge2)
@@ -255,11 +278,11 @@ fn arms_must_be_siblings_and_from_one_definition() {
     assert!(err.contains("siblings"), "{err}");
 
     let mut stray = None;
-    let _ = Wiggle::define("one", 1, |f: wiggle::WiggleFlow<Trip>| {
+    let _ = FlowSpec::define("one", 1, |f: wiggle::WiggleFlow<Trip>| {
         stray = Some(f.then_apply(vip_path));
         f.then_apply(prep)
     });
-    let err = Wiggle::define("two", 1, |f| {
+    let err = FlowSpec::define("two", 1, |f| {
         let mine = f.then_apply(standard_path);
         Wiggle::all_of((mine, stray.take().unwrap())).combine(merge2)
     })
@@ -274,7 +297,7 @@ fn arms_must_be_siblings_and_from_one_definition() {
 
 #[test]
 fn one_of_arms_must_open_with_a_guard() {
-    let err = Wiggle::define("noguard", 1, |f| {
+    let err = FlowSpec::define("noguard", 1, |f| {
         let a = f.when(is_vip).then_apply(vip_path);
         let b = f.then_apply(standard_path);
         Wiggle::one_of(vec![a, b])
@@ -283,7 +306,7 @@ fn one_of_arms_must_open_with_a_guard() {
     .to_string();
     assert!(err.contains("must open with when"), "{err}");
 
-    let err = Wiggle::define("late", 1, |f| {
+    let err = FlowSpec::define("late", 1, |f| {
         let a = f.otherwise().then_apply(standard_path);
         let b = f.when(is_vip).then_apply(vip_path);
         Wiggle::one_of(vec![a, b])
@@ -295,6 +318,6 @@ fn one_of_arms_must_open_with_a_guard() {
 
 #[test]
 fn referencing_one_handler_twice_is_a_duplicate_step() {
-    let err = Wiggle::define("dup", 1, |f| f.then_apply(prep).then_apply(prep)).unwrap_err().to_string();
+    let err = FlowSpec::define("dup", 1, |f| f.then_apply(prep).then_apply(prep)).unwrap_err().to_string();
     assert!(err.contains("duplicate step name 'prep'"), "{err}");
 }

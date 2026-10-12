@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use wiggle::{Branch, Client, Combine, FlowSpec, RetryPolicy, Step, Worker};
+use wiggle::{Branch, Client, Combine, GraphBuilder, RetryPolicy, Step, Worker};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::connect(&url).await?;
 
     // The topology: pure data, no step logic.
-    let order = FlowSpec::define("rs-order-fulfilment", 1)
+    let order = GraphBuilder::define("rs-order-fulfilment", 1)
         .step("validate")
         .gate("in-stock")
         .fork(vec![

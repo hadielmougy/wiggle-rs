@@ -3,9 +3,9 @@
 //!
 //! ```
 //! use std::time::Duration;
-//! use wiggle::{Branch, Case, FlowSpec};
+//! use wiggle::{Branch, Case, GraphBuilder};
 //!
-//! let order = FlowSpec::define("order-fulfilment", 1)
+//! let order = GraphBuilder::define("order-fulfilment", 1)
 //!     .step("validate")
 //!     .gate("in-stock")
 //!     .fork(vec![
@@ -32,22 +32,55 @@ use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
 use crate::retry::RetryPolicy;
+use crate::typed::{FlowBinding, WiggleFlow};
+use crate::worker::Kind;
 
 /// A compiled workflow topology (nodes, edges, kinds, queues, retry) to register with the server.
-/// It carries no step logic and no context type -- the graph is the whole artifact.
-#[derive(Debug, Clone)]
+/// The graph sent to the server carries no step logic and no context type. A spec made by
+/// [`FlowSpec::define`] also keeps the functions its steps were written with, for
+/// [`Worker::flow`](crate::Worker::flow); one built with [`GraphBuilder`] keeps none.
+#[derive(Clone)]
 pub struct FlowSpec {
     name: String,
     version: i32,
     definition: Value,
     queues: Vec<String>,
+    bindings: Vec<FlowBinding>,
 }
 
 impl FlowSpec {
-    /// Starts defining the workflow `name`, published as `version`. The version is declared, not
-    /// derived: a published version is immutable, so a changed graph needs a new number.
-    pub fn define(name: impl Into<String>, version: i32) -> GraphBuilder {
-        GraphBuilder::root(name.into(), version)
+    /// Defines the workflow `name`, published as `version`, as a chain of the functions that
+    /// implement its steps, starting from a `T` -- Java's `FlowSpec.define(name, version,
+    /// T.class, f -> ..)`. `body` runs once, here, and returns the handle the flow ends on. The
+    /// version is declared, not derived: a published version is immutable, so a changed graph
+    /// needs a new number. Steps that name no retry policy get [`RetryPolicy::forever`].
+    pub fn define<T, X>(name: &str, version: i32, body: impl FnOnce(WiggleFlow<T>) -> WiggleFlow<X>) -> Result<FlowSpec> {
+        crate::typed::define(name, version, None, body)
+    }
+
+    /// [`define`](Self::define) with the retry policy for every step that names none -- Java's
+    /// `FlowSpec.define(name, version, defaultRetry, T.class, f -> ..)`.
+    pub fn define_with_retry<T, X>(
+        name: &str,
+        version: i32,
+        default_retry: RetryPolicy,
+        body: impl FnOnce(WiggleFlow<T>) -> WiggleFlow<X>,
+    ) -> Result<FlowSpec> {
+        crate::typed::define(name, version, Some(default_retry), body)
+    }
+
+    pub(crate) fn with_bindings(mut self, bindings: Vec<FlowBinding>) -> Self {
+        self.bindings = bindings;
+        self
+    }
+
+    /// The step names this spec carries handlers for (none for a [`GraphBuilder`] spec).
+    pub fn steps(&self) -> Vec<String> {
+        self.bindings.iter().filter(|b| b.kind != Kind::Compensate).map(|b| b.step.clone()).collect()
+    }
+
+    pub(crate) fn bindings(&self) -> &[FlowBinding] {
+        &self.bindings
     }
 
     pub fn name(&self) -> &str {
@@ -66,6 +99,18 @@ impl FlowSpec {
     /// The definition as the server receives it (the same JSON the Java client sends).
     pub fn definition(&self) -> &Value {
         &self.definition
+    }
+}
+
+impl std::fmt::Debug for FlowSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlowSpec")
+            .field("name", &self.name)
+            .field("version", &self.version)
+            .field("definition", &self.definition)
+            .field("queues", &self.queues)
+            .field("steps", &self.steps())
+            .finish()
     }
 }
 
@@ -107,7 +152,8 @@ struct RootConf {
     default_retry: RetryPolicy,
 }
 
-/// Records a workflow's steps in order. Returned by [`FlowSpec::define`]; nested bodies (a branch,
+/// Records a workflow's steps in order, naming each as a string -- the lower-level topology
+/// builder (Java's `GraphBuilder`), started with [`GraphBuilder::define`]; nested bodies (a branch,
 /// a case, a loop body, an escalation) receive a fresh builder of their own.
 ///
 /// Misuse (a modifier with no step before it, an empty branch, ...) is recorded and reported by
@@ -120,6 +166,13 @@ pub struct GraphBuilder {
 }
 
 impl GraphBuilder {
+    /// Starts defining the workflow `name`, published as `version` -- Java's
+    /// `Workflow.define(name, version)`. The version is declared, not derived: a published version
+    /// is immutable, so a changed graph needs a new number.
+    pub fn define(name: impl Into<String>, version: i32) -> GraphBuilder {
+        GraphBuilder::root(name.into(), version)
+    }
+
     fn root(name: String, version: i32) -> Self {
         GraphBuilder {
             root: Some(RootConf { name, version, default_queue: None, default_retry: RetryPolicy::forever() }),
@@ -814,5 +867,5 @@ fn compile(root: RootConf, nodes: &[Node]) -> Compile<FlowSpec> {
         "queues": queues,
         "executionMode": "SERVER",
     });
-    Ok(FlowSpec { name: root.name, version: root.version, definition, queues })
+    Ok(FlowSpec { name: root.name, version: root.version, definition, queues, bindings: Vec::new() })
 }

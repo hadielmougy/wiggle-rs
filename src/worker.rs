@@ -413,9 +413,9 @@ impl Worker {
         self.bind(workflow, step, Kind::Compensate, compensation_handler(f))
     }
 
-    /// Binds every handler a typed [`Flow`](crate::Flow) was defined with -- each step, gate,
+    /// Binds every handler a [`FlowSpec::define`](crate::FlowSpec::define) spec was defined with -- each step, gate,
     /// combine and compensator -- under the step names the flow gave them.
-    pub fn flow(mut self, flow: &crate::typed::Flow) -> Self {
+    pub fn flow(mut self, flow: &crate::FlowSpec) -> Self {
         for b in flow.bindings() {
             self = self.bind(flow.name(), &b.step, b.kind, b.handler.clone());
         }
@@ -851,7 +851,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flow::{Branch, FlowSpec};
+    use crate::flow::{Branch, GraphBuilder};
     use serde_json::json;
 
     fn binding(step: &str, kind: Kind) -> Binding {
@@ -860,7 +860,7 @@ mod tests {
     }
 
     fn graphs() -> HashMap<String, Value> {
-        let spec = FlowSpec::define("order", 1)
+        let spec = GraphBuilder::define("order", 1)
             .step("validate")
             .gate("in-stock")
             .step("charge")

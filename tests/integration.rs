@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use wiggle::{Branch, Client, Combine, FlowSpec, RetryPolicy, Step, StepError, Worker, WorkerOptions};
+use wiggle::{Branch, Client, Combine, FlowSpec, GraphBuilder, RetryPolicy, Step, StepError, Worker, WorkerOptions};
 
 async fn client() -> Option<Client> {
     let url = std::env::var("WIGGLE_TEST_URL").ok()?;
@@ -40,7 +40,7 @@ struct Order {
 async fn linear_flow_with_gate_effect_and_events() {
     let Some(client) = client().await else { return };
     let wf = unique("order");
-    let spec = FlowSpec::define(&wf, 1)
+    let spec = GraphBuilder::define(&wf, 1)
         .step("validate")
         .gate("in-stock")
         .step("charge")
@@ -118,7 +118,7 @@ async fn linear_flow_with_gate_effect_and_events() {
 async fn fork_and_for_each_combine() {
     let Some(client) = client().await else { return };
     let wf = unique("fan");
-    let spec = FlowSpec::define(&wf, 1)
+    let spec = GraphBuilder::define(&wf, 1)
         .fork(vec![
             Branch::of("left", |s| s.step("l")),
             Branch::of("right", |s| s.step("r")),
@@ -166,7 +166,7 @@ async fn fork_and_for_each_combine() {
 async fn failure_runs_compensators() {
     let Some(client) = client().await else { return };
     let wf = unique("saga");
-    let spec = FlowSpec::define(&wf, 1)
+    let spec = GraphBuilder::define(&wf, 1)
         .step("reserve")
         .compensate()
         .step("charge")
@@ -208,7 +208,7 @@ async fn failure_runs_compensators() {
 async fn worker_refuses_mismatched_bindings() {
     let Some(client) = client().await else { return };
     let wf = unique("strict");
-    let spec = FlowSpec::define(&wf, 1).gate("ok").build().unwrap();
+    let spec = GraphBuilder::define(&wf, 1).gate("ok").build().unwrap();
     client.register(&spec).await.unwrap();
 
     let err = Worker::new(client.clone(), "rs-it-strict")
@@ -289,7 +289,7 @@ mod typed {
     async fn typed_flow_binds_its_own_handlers() {
         let Some(client) = client().await else { return };
         let wf = unique("trip");
-        let flow = Wiggle::define(&wf, 1, |f| {
+        let flow = FlowSpec::define(&wf, 1, |f| {
             let prepped = f.then_apply(prep);
             let air = prepped.then_apply(book_air);
             let hotel = prepped.then_apply(book_hotel);
@@ -357,7 +357,7 @@ mod branches {
     async fn steps_open_branches_that_rejoin_at_the_spawn_combine() {
         let Some(client) = client().await else { return };
         let wf = unique("branches");
-        let spec = FlowSpec::define(&wf, 1).step("split").spawn_combine("collect").build().unwrap();
+        let spec = GraphBuilder::define(&wf, 1).step("split").spawn_combine("collect").build().unwrap();
         client.register(&spec).await.unwrap();
 
         let worker = Worker::new(client.clone(), "rs-it-branches")
@@ -399,7 +399,7 @@ mod branches {
     async fn keyed_branches_rejoin_as_a_map() {
         let Some(client) = client().await else { return };
         let wf = unique("keyed-branches");
-        let spec = FlowSpec::define(&wf, 1).step("split").spawn_combine("collect").build().unwrap();
+        let spec = GraphBuilder::define(&wf, 1).step("split").spawn_combine("collect").build().unwrap();
         client.register(&spec).await.unwrap();
 
         let worker = Worker::new(client.clone(), "rs-it-keyed")
@@ -457,7 +457,7 @@ mod branches {
     async fn a_false_gate_ends_only_its_branch() {
         let Some(client) = client().await else { return };
         let wf = unique("gated-branches");
-        let spec = FlowSpec::define(&wf, 1).step("fulfil").spawn_combine("summarise").build().unwrap();
+        let spec = GraphBuilder::define(&wf, 1).step("fulfil").spawn_combine("summarise").build().unwrap();
         client.register(&spec).await.unwrap();
 
         let worker = Worker::new(client.clone(), "rs-it-gated")
@@ -509,7 +509,7 @@ mod branches {
     async fn compensable_branch_steps_are_undone_when_the_instance_fails() {
         let Some(client) = client().await else { return };
         let wf = unique("branch-saga");
-        let spec = FlowSpec::define(&wf, 1)
+        let spec = GraphBuilder::define(&wf, 1)
             .step("fulfil")
             .spawn_combine("summarise")
             .step("boom")

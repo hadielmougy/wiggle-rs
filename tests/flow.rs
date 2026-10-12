@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use wiggle::{Branch, Case, FlowSpec, RetryPolicy};
+use wiggle::{Branch, Case, FlowSpec, GraphBuilder, RetryPolicy};
 
 fn nodes(spec: &FlowSpec) -> HashMap<String, Value> {
     spec.definition()["nodes"]
@@ -22,7 +22,7 @@ fn by_name<'a>(nodes: &'a HashMap<String, Value>, name: &str) -> &'a Value {
 
 #[test]
 fn linear_chain_with_gate() {
-    let spec = FlowSpec::define("order", 1)
+    let spec = GraphBuilder::define("order", 1)
         .step("validate")
         .gate("in-stock")
         .step("charge")
@@ -58,7 +58,7 @@ fn linear_chain_with_gate() {
 
 #[test]
 fn fork_rejoins_at_its_combine() {
-    let spec = FlowSpec::define("order", 1)
+    let spec = GraphBuilder::define("order", 1)
         .step("validate")
         .fork(vec![
             Branch::of("payment", |s| s.step("charge").gate("approved")),
@@ -92,7 +92,7 @@ fn fork_rejoins_at_its_combine() {
 
 #[test]
 fn for_each_collects_at_its_combine() {
-    let spec = FlowSpec::define("batch", 1)
+    let spec = GraphBuilder::define("batch", 1)
         .for_each("lines", |s| s.step("price"))
         .combine("total")
         .build()
@@ -113,7 +113,7 @@ fn for_each_collects_at_its_combine() {
 
 #[test]
 fn choose_chains_guards_and_otherwise() {
-    let spec = FlowSpec::define("greet", 1)
+    let spec = GraphBuilder::define("greet", 1)
         .choose(vec![
             Case::when("vip", |s| s.step("concierge")),
             Case::when("regular", |s| s.step("thanks")),
@@ -137,7 +137,7 @@ fn choose_chains_guards_and_otherwise() {
 
 #[test]
 fn choose_without_otherwise_falls_through() {
-    let spec = FlowSpec::define("greet", 1)
+    let spec = GraphBuilder::define("greet", 1)
         .choose(vec![Case::when("vip", |s| s.step("concierge"))])
         .step("done")
         .build()
@@ -150,7 +150,7 @@ fn choose_without_otherwise_falls_through() {
 
 #[test]
 fn do_while_loops_back_through_its_condition() {
-    let spec = FlowSpec::define("poll", 1)
+    let spec = GraphBuilder::define("poll", 1)
         .do_while_max("again", 50, |s| s.step("check").sleep(Duration::from_secs(5)))
         .step("after")
         .build()
@@ -168,13 +168,13 @@ fn do_while_loops_back_through_its_condition() {
     assert_eq!(sleep["sleepMillis"], 5000);
     assert_eq!(sleep["next"], cond["id"]);
 
-    let default_budget = FlowSpec::define("p", 1).do_while("c", |s| s.step("x")).build().unwrap();
+    let default_budget = GraphBuilder::define("p", 1).do_while("c", |s| s.step("x")).build().unwrap();
     assert_eq!(by_name(&nodes(&default_budget), "c")["loopBudget"], -1);
 }
 
 #[test]
 fn signal_escalation_rejoins() {
-    let spec = FlowSpec::define("approve", 1)
+    let spec = GraphBuilder::define("approve", 1)
         .await_signal_or("approved", Duration::from_secs(60), |s| s.step("escalate"))
         .step("ship")
         .build()
@@ -191,7 +191,7 @@ fn signal_escalation_rejoins() {
 
 #[test]
 fn compensate_and_sub_workflow() {
-    let spec = FlowSpec::define("trip", 1)
+    let spec = GraphBuilder::define("trip", 1)
         .step("book-hotel")
         .compensate()
         .sub_workflow("pay", "payment")
@@ -211,25 +211,25 @@ fn compensate_and_sub_workflow() {
 #[test]
 fn rejects_invalid_topologies() {
     let err = |r: wiggle::Result<FlowSpec>| r.unwrap_err().to_string();
-    assert!(err(FlowSpec::define("w", 0).step("a").build()).contains("positive version"));
-    assert!(err(FlowSpec::define("w", 1).build()).contains("defines no steps"));
-    assert!(err(FlowSpec::define("w", 1).step("a").step("a").build()).contains("duplicate step name 'a'"));
-    assert!(err(FlowSpec::define("w", 1).fork(vec![Branch::of("x", |s| s.step("a"))]).combine("m").build())
+    assert!(err(GraphBuilder::define("w", 0).step("a").build()).contains("positive version"));
+    assert!(err(GraphBuilder::define("w", 1).build()).contains("defines no steps"));
+    assert!(err(GraphBuilder::define("w", 1).step("a").step("a").build()).contains("duplicate step name 'a'"));
+    assert!(err(GraphBuilder::define("w", 1).fork(vec![Branch::of("x", |s| s.step("a"))]).combine("m").build())
         .contains("at least two branches"));
-    assert!(err(FlowSpec::define("w", 1)
+    assert!(err(GraphBuilder::define("w", 1)
         .fork(vec![Branch::of("x", |s| s.step("a")), Branch::of("y", |s| s)])
         .combine("m")
         .build())
     .contains("branch 'y' defines no steps"));
-    assert!(err(FlowSpec::define("w", 1)
+    assert!(err(GraphBuilder::define("w", 1)
         .choose(vec![Case::otherwise(|s| s.step("a")), Case::when("g", |s| s.step("b"))])
         .build())
     .contains("otherwise case must be last"));
-    assert!(err(FlowSpec::define("w", 1).sleep(Duration::from_secs(1)).compensate().build())
+    assert!(err(GraphBuilder::define("w", 1).sleep(Duration::from_secs(1)).compensate().build())
         .contains("compensate() must directly follow"));
-    assert!(err(FlowSpec::define("w", 1).sleep(Duration::from_secs(1)).queue("q").build())
+    assert!(err(GraphBuilder::define("w", 1).sleep(Duration::from_secs(1)).queue("q").build())
         .contains("queue() must directly follow"));
-    assert!(err(FlowSpec::define("w", 1)
+    assert!(err(GraphBuilder::define("w", 1)
         .fork(vec![Branch::of("x", |s| s.step("a").default_queue("q")), Branch::of("y", |s| s.step("b"))])
         .combine("m")
         .build())

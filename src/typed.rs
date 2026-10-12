@@ -1,9 +1,9 @@
 //! The typed flow API: a workflow written as a chain of the very functions that implement its
-//! steps -- the Rust counterpart of the Java client's `Wiggle` / `WiggleFlow`.
+//! steps -- the Rust counterpart of the Java client's `FlowSpec.define` / `WiggleFlow` / `Wiggle`.
 //!
 //! ```
 //! use serde::{Deserialize, Serialize};
-//! use wiggle::{StepError, Wiggle};
+//! use wiggle::{FlowSpec, StepError, Wiggle};
 //!
 //! #[derive(Serialize, Deserialize)] struct Order { id: String, qty: u32 }
 //! #[derive(Serialize, Deserialize)] struct Payment { auth: String }
@@ -19,7 +19,7 @@
 //! }
 //! async fn notify(_: Receipt) -> Result<(), StepError> { Ok(()) }
 //!
-//! let order = Wiggle::define("order-fulfilment", 1, |f| {
+//! let order = FlowSpec::define("order-fulfilment", 1, |f| {
 //!     let validated = f.then_apply(validate).then_filter(in_stock);
 //!
 //!     let payment = validated.then_apply(charge);   // continuing `validated` twice
@@ -47,7 +47,7 @@
 //! [`named`](WiggleFlow::named).
 //!
 //! **Handlers travel with the flow.** Unlike Java, which finds handler methods by reflection,
-//! the functions named here are kept in the [`Flow`]: [`Worker::flow`](crate::Worker::flow)
+//! the functions named here are kept in the [`FlowSpec`]: [`Worker::flow`](crate::Worker::flow)
 //! binds all of them at once, under the same names.
 //!
 //! **Handles are not futures.** Nothing runs while the flow is defined, and a handle continued
@@ -58,7 +58,6 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::marker::PhantomData;
-use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,14 +76,6 @@ use crate::worker::{
     Kind, Outcome,
 };
 
-/// A workflow defined with [`Wiggle::define`]: its topology (it derefs to the [`FlowSpec`] to
-/// register) and the handlers its steps were written with, for [`Worker::flow`](crate::Worker::flow).
-#[derive(Clone)]
-pub struct Flow {
-    spec: FlowSpec,
-    bindings: Vec<FlowBinding>,
-}
-
 #[derive(Clone)]
 pub(crate) struct FlowBinding {
     pub(crate) step: String,
@@ -92,56 +83,10 @@ pub(crate) struct FlowBinding {
     pub(crate) handler: Handler,
 }
 
-impl Flow {
-    pub fn spec(&self) -> &FlowSpec {
-        &self.spec
-    }
-
-    /// The step names this flow carries handlers for, with each one's kind.
-    pub fn steps(&self) -> Vec<String> {
-        self.bindings.iter().filter(|b| b.kind != Kind::Compensate).map(|b| b.step.clone()).collect()
-    }
-
-    pub(crate) fn bindings(&self) -> &[FlowBinding] {
-        &self.bindings
-    }
-}
-
-impl Deref for Flow {
-    type Target = FlowSpec;
-
-    fn deref(&self) -> &FlowSpec {
-        &self.spec
-    }
-}
-
-impl AsRef<str> for Flow {
-    fn as_ref(&self) -> &str {
-        self.spec.name()
-    }
-}
-
-impl std::fmt::Debug for Flow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Flow").field("spec", &self.spec).field("steps", &self.steps()).finish()
-    }
-}
-
 /// Entry point of the typed flow API.
 pub struct Wiggle;
 
 impl Wiggle {
-    /// Defines the workflow `name`, published as `version`, whose first step takes a `T`. `body`
-    /// runs once, here, and returns the handle the flow ends on.
-    pub fn define<T, X>(name: &str, version: i32, body: impl FnOnce(WiggleFlow<T>) -> WiggleFlow<X>) -> Result<Flow> {
-        Wiggle::flow(name, version).define(body)
-    }
-
-    /// [`define`](Self::define) with workflow-wide defaults.
-    pub fn flow(name: &str, version: i32) -> FlowDefaults {
-        FlowDefaults { name: name.to_string(), version, default_queue: None, default_retry: None }
-    }
-
     /// Fans the flow out over handles that branched from a common point -- a tuple of 2 to 8 of
     /// them -- and returns the mandatory combine stage. Each arm runs on its own isolated copy of
     /// the context, so the combine is the only way an arm's result reaches the flow. An arm is
@@ -178,52 +123,33 @@ impl Wiggle {
     }
 }
 
-/// Workflow-wide defaults for [`Wiggle::flow`].
-pub struct FlowDefaults {
-    name: String,
+/// Records `body` and compiles it -- [`FlowSpec::define`] and
+/// [`FlowSpec::define_with_retry`](FlowSpec::define_with_retry).
+pub(crate) fn define<T, X>(
+    name: &str,
     version: i32,
-    default_queue: Option<String>,
     default_retry: Option<RetryPolicy>,
-}
-
-impl FlowDefaults {
-    /// The queue for steps that name none (defaults to the workflow name).
-    pub fn default_queue(mut self, queue: impl Into<String>) -> Self {
-        self.default_queue = Some(queue.into());
-        self
+    body: impl FnOnce(WiggleFlow<T>) -> WiggleFlow<X>,
+) -> Result<FlowSpec> {
+    let plan = Rc::new(RefCell::new(Arena::default()));
+    let root = plan.borrow_mut().add(None, Op::Root);
+    let tail = body(WiggleFlow::at(plan.clone(), root));
+    if !Rc::ptr_eq(&tail.plan, &plan) {
+        return Err(Error::Flow(format!("the body of workflow '{name}' returned a handle from another definition")));
     }
-
-    /// The retry policy for steps that name none (defaults to [`RetryPolicy::forever`]).
-    pub fn default_retry(mut self, retry: RetryPolicy) -> Self {
-        self.default_retry = Some(retry);
-        self
+    if let Some(e) = plan.borrow().error.clone() {
+        return Err(Error::Flow(e));
     }
-
-    /// See [`Wiggle::define`].
-    pub fn define<T, X>(self, body: impl FnOnce(WiggleFlow<T>) -> WiggleFlow<X>) -> Result<Flow> {
-        let plan = Rc::new(RefCell::new(Arena::default()));
-        let root = plan.borrow_mut().add(None, Op::Root);
-        let tail = body(WiggleFlow::at(plan.clone(), root));
-        if !Rc::ptr_eq(&tail.plan, &plan) {
-            return Err(Error::Flow(format!(
-                "the body of workflow '{}' returned a handle from another definition",
-                self.name
-            )));
-        }
-        if let Some(e) = plan.borrow().error.clone() {
-            return Err(Error::Flow(e));
-        }
-        let mut b = FlowSpec::define(self.name.clone(), self.version);
-        if let Some(q) = self.default_queue {
-            b = b.default_queue(q);
-        }
-        if let Some(r) = self.default_retry {
-            b = b.default_retry(r);
-        }
-        let spec = walk(&plan, root, b, &format!("workflow '{}'", self.name)).build()?;
-        let bindings = plan.borrow().bindings();
-        Ok(Flow { spec, bindings })
+    let mut b = GraphBuilder::define(name, version);
+    if let Some(q) = plan.borrow().default_queue.clone() {
+        b = b.default_queue(q);
     }
+    if let Some(r) = default_retry {
+        b = b.default_retry(r);
+    }
+    let spec = walk(&plan, root, b, &format!("workflow '{name}'")).build()?;
+    let bindings = plan.borrow().bindings();
+    Ok(spec.with_bindings(bindings))
 }
 
 // ---- the plan: a tree of recorded steps, shared by every handle of one definition ----
@@ -271,6 +197,8 @@ struct PNode {
 struct Arena {
     nodes: Vec<PNode>,
     error: Option<String>,
+    /// Set by [`WiggleFlow::default_queue`] on the definition's root.
+    default_queue: Option<String>,
 }
 
 impl Arena {
@@ -583,6 +511,20 @@ impl<T> WiggleFlow<T> {
     /// The retry policy of the step just added.
     pub fn retry(self, retry: RetryPolicy) -> Self {
         self.tune("retry()", |d| d.retry = Some(retry))
+    }
+
+    /// The queue for every step that names none (else the workflow name), like Java's
+    /// `defaultQueue`. Call it on the flow's starting handle, before any step.
+    pub fn default_queue(self, queue: impl Into<String>) -> Self {
+        {
+            let mut plan = self.plan.borrow_mut();
+            if self.node == 0 {
+                plan.default_queue = Some(queue.into());
+            } else {
+                plan.fail("default_queue() must be called on the flow's starting handle, before any step".into());
+            }
+        }
+        self
     }
 
     /// Reinterprets the context type from here on -- after a signal merged a payload, say, or to

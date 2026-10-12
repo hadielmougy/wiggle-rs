@@ -20,40 +20,41 @@ The library is imported as `wiggle`. Building it needs `protoc` on the `PATH` (`
 ```rust
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
-use wiggle::{Client, FlowSpec, RetryPolicy, Worker};
+use wiggle::{Client, RetryPolicy, StepError, Wiggle, WiggleFlow, Worker};
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Order { order_id: String, quantity: u32, status: Option<String> }
 
+// The steps: plain async functions. The input is decoded from the step's JSON context with serde,
+// the return encoded back -- it is the COMPLETE next context.
+async fn validate(mut o: Order) -> Result<Order, StepError> {
+    o.status = Some("VALIDATED".into());
+    Ok(o)
+}
+async fn in_stock(o: Order) -> Result<bool, StepError> { Ok(o.quantity > 0) }
+async fn charge(o: Order) -> Result<Order, StepError> { Ok(o) }
+async fn notify(o: Order) -> Result<(), StepError> {
+    println!("shipped {}", o.order_id);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), wiggle::Error> {
     let client = Client::connect("localhost:8080").await?;
 
-    // The topology: named steps and how they chain. No step logic.
-    let order = FlowSpec::define("order", 1)
-        .step("validate")
-        .gate("in-stock")
-        .step("charge").queue("payments").retry(RetryPolicy::exponential(5, Duration::from_millis(100)))
-        .effect("notify")
-        .build()?;
+    // The workflow: a chain of the step functions, checked by the compiler -- Java's
+    // FlowSpec.define("order", 1, Order.class, f -> f.thenApply(h::validate).thenFilter(h::inStock)...).
+    let order = FlowSpec::define("order", 1, |f: WiggleFlow<Order>| {
+        f.then_apply(validate)
+            .then_filter(in_stock)
+            .then_apply(charge).queue("payments").retry(RetryPolicy::exponential(5, Duration::from_millis(100)))
+            .then_accept(notify)
+    })?;
     client.register(&order).await?;
 
-    // The logic: handlers bound by name. Input is decoded from the step's JSON context with serde,
-    // the return encoded back -- it is the COMPLETE next context.
-    let worker = Worker::new(client.clone(), "worker-1")
-        .handle("order", "validate", |mut o: Order| async move {
-            o.status = Some("VALIDATED".into());
-            Ok(o)
-        })
-        .gate("order", "in-stock", |o: Order| async move { Ok(o.quantity > 0) })
-        .handle("order", "charge", |o: Order| async move { Ok(o) })
-        .effect("order", "notify", |o: Order| async move {
-            println!("shipped {}", o.order_id);
-            Ok(())
-        })
-        .start()
-        .await?;
+    // The flow carries its handlers: the worker binds each under its step name.
+    let worker = Worker::new(client.clone(), "worker-1").flow(&order).start().await?;
 
     let id = client.start(&order, &Order { order_id: "A-1".into(), quantity: 3, status: None }).await?;
     let view = client.await_completion(&id, Duration::from_secs(30)).await?;
@@ -64,7 +65,11 @@ async fn main() -> Result<(), wiggle::Error> {
 }
 ```
 
-Run the bundled example against a server on `:8080`:
+This is the same shape as the Java client's typed flows (see [Typed flows](#typed-flows)). The
+lower-level [topology builder](#topology) names steps as strings and binds handlers to them
+separately; the two produce identical definitions.
+
+Run the bundled example (topology builder, forks and run-time branches) against a server on `:8080`:
 
 ```bash
 WIGGLE_URL=localhost:8080 cargo run --example order
@@ -72,14 +77,15 @@ WIGGLE_URL=localhost:8080 cargo run --example order
 
 ## Topology
 
-`FlowSpec::define(name, version)` returns a builder with the same vocabulary as the Java
-`GraphBuilder`. The version is declared, not derived: a published version is immutable, so a changed
+`GraphBuilder::define(name, version)` (Java's `Workflow.define`) returns the lower-level builder,
+with the same vocabulary as the Java `GraphBuilder`: steps are named as strings, and handlers are
+bound to those names on the worker. The version is declared, not derived: a published version is immutable, so a changed
 graph needs a new number. Misuse is reported by `build()`.
 
 ```rust
-use wiggle::{Branch, Case, FlowSpec};
+use wiggle::{Branch, Case, GraphBuilder};
 
-let wf = FlowSpec::define("order-fulfilment", 1)
+let wf = GraphBuilder::define("order-fulfilment", 1)
     .default_queue("orders")                 // else the workflow name
     .step("validate")
     .gate("in-stock")
@@ -133,7 +139,7 @@ A decode failure fails the step permanently.
 | `combine(wf, step, f)` | `Fn(Combine) -> Future<Result<O, StepError>>` | a fork / forEach combine |
 | `compensation(wf, step, f)` | `Fn(Compensation) -> Future<Result<(), StepError>>` | the undo of a `compensate()` step |
 | `branch_steps(wf, BranchSteps)` | the functions themselves | steps that run-time branches chain on (see below) |
-| `flow(&flow)` | carried by a typed `Flow` | every step of a typed flow (see [Typed flows](#typed-flows)) |
+| `flow(&spec)` | carried by a `FlowSpec::define` spec | every step of a typed flow (see [Typed flows](#typed-flows)) |
 
 `start()` **reconciles** every binding against the registered graph: a mistyped step name fails
 fast with the available names, a handler bound with the wrong kind (a task on a gate, a plain
@@ -219,7 +225,7 @@ their results reach the combine — a list in creation order, or a map by key wi
 ```rust
 use wiggle::{BranchSteps, Combine, Step, StepError, Worker};
 
-// topology: FlowSpec::define("orders", 1).step("split").spawn_combine("collect")
+// topology: GraphBuilder::define("orders", 1).step("split").spawn_combine("collect")
 async fn split(o: Order) -> Result<Order, StepError> {
     for item in &o.items {
         Step::create(item)?
@@ -251,12 +257,12 @@ topology's `wiggle::Branch` (Java keeps them in separate packages, `worker` and 
 
 ## Typed flows
 
-The counterpart of the Java client's `Wiggle.allOf` / `WiggleFlow`: a workflow written as a chain
+The counterpart of the Java client's `FlowSpec.define` / `WiggleFlow` / `Wiggle.allOf`: a workflow written as a chain
 of the very functions that implement its steps, checked by the compiler. Each step's input type is
 the previous step's output type, and a fork's combine takes one parameter per arm, in arm order.
 
 ```rust
-use wiggle::{StepError, Wiggle, Worker};
+use wiggle::{FlowSpec, StepError, Wiggle, Worker};
 
 async fn validate(o: Order) -> Result<Order, StepError> { /* ... */ }
 async fn in_stock(o: Order) -> Result<bool, StepError> { /* ... */ }
@@ -265,7 +271,7 @@ async fn label(o: Order) -> Result<Shipment, StepError> { /* ... */ }
 async fn settle(p: Payment, s: Shipment) -> Result<Receipt, StepError> { /* ... */ }
 async fn notify(r: Receipt) -> Result<(), StepError> { /* ... */ }
 
-let order = Wiggle::define("order-fulfilment", 1, |f| {
+let order = FlowSpec::define("order-fulfilment", 1, |f| {
     let validated = f.then_apply(validate).then_filter(in_stock);
 
     let payment = validated.then_apply(charge);       // continuing `validated` twice
@@ -284,7 +290,7 @@ let worker = Worker::new(client.clone(), "orders-1").flow(&order).start().await?
   A closure, or a step that must match an existing graph's name, is named with
   `.named("in-stock")`. `.queue(..)` and `.retry(..)` tune the step just added.
 - **Handlers travel with the flow**: Java finds handler methods by reflection; here the functions
-  are kept in the `Flow`, and `Worker::flow(&flow)` binds all of them under the same names.
+  are kept in the `FlowSpec`, and `Worker::flow(&spec)` binds all of them under the same names.
 - **Handles are not futures.** Nothing runs at definition time. A handle continued twice is a
   fan-out; a split that never reaches `all_of` fails the definition, naming both dangling ends.
   So does a fan-out with no combine, arms that do not share a fork point, and two arms ending at
@@ -303,8 +309,10 @@ let worker = Worker::new(client.clone(), "orders-1").flow(&order).start().await?
 | `repeat_while(cond, \|b\| ..)` / `repeat_while_max(cond, n, \|b\| ..)` | a do-while loop |
 | `then_sleep(d)`, `then_await(signal)`, `then_await_or(signal, d, \|esc\| ..)`, `then_sub_flow::<R>(node, wf)` | timers, signals, sub-workflows |
 
-`Wiggle::flow(name, version).default_queue(..).default_retry(..).define(..)` sets workflow-wide
-defaults. A typed flow compiles to exactly the definition the builder produces for the same shape.
+Workflow-wide defaults: `FlowSpec::define_with_retry(name, version, retry, body)` sets the retry
+policy of every step that names none (else `RetryPolicy::forever()`), and `f.default_queue(q)`, on
+the starting handle, the queue (else the workflow name). A typed flow compiles to exactly the
+definition `GraphBuilder` produces for the same shape.
 
 ## Client API
 
@@ -348,7 +356,10 @@ binds closures.
 | `GraphBuilder.sleep(name, d)` / `forEach(name, key, body)` | `sleep_named(name, d)` / `for_each_named(name, key, body)` |
 | `awaitSignal(name, timeout[, escalation])` | `await_signal_timeout(..)` / `await_signal_or(..)` |
 | `doWhile(cond, max, body)` | `do_while_max(cond, max, body)` |
-| `FlowSpec.define(name, v, Order.class, f -> ..)` | `Wiggle::define(name, v, \|f: WiggleFlow<Order>\| ..)` |
+| `FlowSpec.define(name, v, Order.class, f -> ..)` | `FlowSpec::define(name, v, \|f: WiggleFlow<Order>\| ..)` |
+| `FlowSpec.define(name, v, defaultRetry, Order.class, f -> ..)` | `FlowSpec::define_with_retry(name, v, retry, body)` |
+| `f.defaultQueue(q)` | `f.default_queue(q)` (on the starting handle) |
+| `Workflow.define(name, v)` → `GraphBuilder` | `GraphBuilder::define(name, v)` |
 | `thenSleep(name, d)` / `thenAwait(signal, timeout[, escalation])` | `then_sleep_named` / `then_await_timeout` / `then_await_or` |
 | `thenForEach(name, key, body)` | `then_for_each_named(name, key, body)` |
 | `repeatWhile(cond, max, body)` | `repeat_while_max(cond, max, body)` |
