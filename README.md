@@ -228,7 +228,7 @@ use wiggle::{BranchSteps, Combine, Step, StepError, Worker};
 // topology: GraphBuilder::define("orders", 1).step("split").spawn_combine("collect")
 async fn split(o: Order) -> Result<Order, StepError> {
     for item in &o.items {
-        Step::create(item)?
+        Step::create(item.clone())?
             .then_apply_compensable(reserve)       // undone by the compensation below
             .then_filter(in_stock)
             .then_apply(ship);
@@ -254,6 +254,13 @@ A branch has the same vocabulary as a typed flow: `then_apply`, `then_apply_comp
 `repeat_while`, and `combine(f)` to make a branch step a spawning step of its own. `.named(..)`,
 `.queue(..)` and `.retry(..)` tune the step just added. `branch::Branch` is distinct from the
 topology's `wiggle::Branch` (Java keeps them in separate packages, `worker` and `flow`).
+
+A runnable version, with digital and physical items taking different steps and an out-of-stock
+item gated out of its branch:
+
+```bash
+WIGGLE_URL=localhost:8080 cargo run --example branches
+```
 
 ## Typed flows
 
