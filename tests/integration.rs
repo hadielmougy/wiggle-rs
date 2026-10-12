@@ -431,4 +431,118 @@ mod branches {
         assert_eq!(view.context["x"], 40);
         assert_eq!(view.context["y"], 50);
     }
+
+    #[derive(Serialize, Deserialize)]
+    struct Item {
+        item: String,
+        #[serde(default)]
+        reserved: bool,
+        #[serde(default)]
+        via: Option<String>,
+    }
+
+    async fn reserve(mut i: Item) -> R<Item> {
+        i.reserved = true;
+        Ok(i)
+    }
+    async fn in_stock(i: Item) -> R<bool> {
+        Ok(!i.item.contains("gone"))
+    }
+    async fn ship(mut i: Item) -> R<Item> {
+        i.via = Some("ship".into());
+        Ok(i)
+    }
+
+    #[tokio::test]
+    async fn a_false_gate_ends_only_its_branch() {
+        let Some(client) = client().await else { return };
+        let wf = unique("gated-branches");
+        let spec = FlowSpec::define(&wf, 1).step("fulfil").spawn_combine("summarise").build().unwrap();
+        client.register(&spec).await.unwrap();
+
+        let worker = Worker::new(client.clone(), "rs-it-gated")
+            .options(opts())
+            .handle(&wf, "fulfil", |v: Value| async move {
+                for item in ["book", "chair-gone", "lamp"] {
+                    Step::create(Item { item: item.into(), reserved: false, via: None })?
+                        .then_apply(reserve)
+                        .then_filter(in_stock)
+                        .then_apply(ship);
+                }
+                Ok(v)
+            })
+            .combine(&wf, "summarise", |c: Combine| async move {
+                let items: Vec<Item> = c.items_as()?;
+                let summary: Vec<String> = items
+                    .iter()
+                    .map(|i| format!("{}:{}:{}", i.item, i.reserved, i.via.as_deref().unwrap_or("null")))
+                    .collect();
+                Ok(json!({"summary": summary}))
+            })
+            .branch_steps(&wf, BranchSteps::new().handle(reserve).gate(in_stock).handle(ship))
+            .start()
+            .await
+            .unwrap();
+
+        let id = client.start(&spec, &json!({})).await.unwrap();
+        let view = client.await_completion(&id, Duration::from_secs(30)).await.unwrap();
+        worker.close().await;
+
+        assert_eq!(view.status, "COMPLETED", "{view:?}");
+        // The gated branch rejoins with its context as of the gate: reserved, never shipped.
+        assert_eq!(view.context["summary"], json!(["book:true:ship", "chair-gone:true:null", "lamp:true:ship"]));
+    }
+
+    static UNDONE: AtomicU32 = AtomicU32::new(0);
+
+    async fn charge(mut v: Value) -> R<Value> {
+        v["charged"] = json!(true);
+        Ok(v)
+    }
+    async fn refund(c: wiggle::Compensation) -> R<()> {
+        assert_eq!(c.result_as::<Value>()?["charged"], true);
+        UNDONE.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compensable_branch_steps_are_undone_when_the_instance_fails() {
+        let Some(client) = client().await else { return };
+        let wf = unique("branch-saga");
+        let spec = FlowSpec::define(&wf, 1)
+            .step("fulfil")
+            .spawn_combine("summarise")
+            .step("boom")
+            .retry(RetryPolicy::none())
+            .build()
+            .unwrap();
+        client.register(&spec).await.unwrap();
+
+        let worker = Worker::new(client.clone(), "rs-it-branch-saga")
+            .options(opts())
+            .handle(&wf, "fulfil", |v: Value| async move {
+                for item in ["a", "b"] {
+                    Step::create(json!({"item": item}))?.then_apply_compensable(charge);
+                }
+                Ok(v)
+            })
+            .combine(&wf, "summarise", |c: Combine| async move {
+                let results: Vec<Value> = c.items_as()?;
+                Ok(json!({"charged": results.len()}))
+            })
+            .handle(&wf, "boom", |_: Value| async move {
+                Err::<Value, _>(StepError::permanent("deliberate: the charges must be undone"))
+            })
+            .branch_steps(&wf, BranchSteps::new().handle(charge).compensation(charge, refund))
+            .start()
+            .await
+            .unwrap();
+
+        let id = client.start(&spec, &json!({})).await.unwrap();
+        let view = client.await_completion(&id, Duration::from_secs(30)).await.unwrap();
+        worker.close().await;
+
+        assert_eq!(view.status, "COMPENSATED", "{view:?}");
+        assert_eq!(UNDONE.load(Ordering::SeqCst), 2, "each branch's charge was undone");
+    }
 }
