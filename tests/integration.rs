@@ -321,3 +321,114 @@ mod typed {
         assert_eq!(b.context["service"], "self");
     }
 }
+
+mod branches {
+    use super::*;
+    use wiggle::BranchSteps;
+
+    #[derive(Serialize, Deserialize)]
+    struct Line {
+        sku: String,
+        qty: u32,
+    }
+    #[derive(Serialize, Deserialize)]
+    struct Priced {
+        sku: String,
+        amount: u32,
+    }
+
+    type R<T> = Result<T, StepError>;
+
+    static AUDITED: AtomicU32 = AtomicU32::new(0);
+
+    async fn price(l: Line) -> R<Priced> {
+        Ok(Priced { sku: l.sku, amount: l.qty * 10 })
+    }
+    async fn add_tax(mut p: Priced) -> R<Priced> {
+        p.amount += 1;
+        Ok(p)
+    }
+    async fn audit(_: Priced) -> R<()> {
+        AUDITED.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn steps_open_branches_that_rejoin_at_the_spawn_combine() {
+        let Some(client) = client().await else { return };
+        let wf = unique("branches");
+        let spec = FlowSpec::define(&wf, 1).step("split").spawn_combine("collect").build().unwrap();
+        client.register(&spec).await.unwrap();
+
+        let worker = Worker::new(client.clone(), "rs-it-branches")
+            .options(opts())
+            .handle(&wf, "split", |mut v: Value| async move {
+                let lines: Vec<Line> = serde_json::from_value(v["lines"].take()).map_err(StepError::from)?;
+                for line in lines {
+                    Step::create(line)?.then_apply(price).then_apply(add_tax).then_accept(audit);
+                }
+                v["split"] = json!(true);
+                Ok(v)
+            })
+            .combine(&wf, "collect", |c: Combine| async move {
+                // The branches' results in creation order; the base is the spawning step's return.
+                let priced: Vec<Priced> = c.items_as()?;
+                let mut out = c.base().clone();
+                out["skus"] = json!(priced.iter().map(|p| p.sku.as_str()).collect::<Vec<_>>());
+                out["total"] = json!(priced.iter().map(|p| p.amount).sum::<u32>());
+                Ok(out)
+            })
+            .branch_steps(&wf, BranchSteps::new().handle(price).handle(add_tax).effect(audit))
+            .start()
+            .await
+            .unwrap();
+
+        let lines = json!({"lines": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 2}, {"sku": "c", "qty": 3}]});
+        let id = client.start(&spec, &lines).await.unwrap();
+        let view = client.await_completion(&id, Duration::from_secs(30)).await.unwrap();
+        worker.close().await;
+
+        assert_eq!(view.status, "COMPLETED", "{view:?}");
+        assert_eq!(view.context["split"], true);
+        assert_eq!(view.context["skus"], json!(["a", "b", "c"]));
+        assert_eq!(view.context["total"], 63);
+        assert_eq!(AUDITED.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn keyed_branches_rejoin_as_a_map() {
+        let Some(client) = client().await else { return };
+        let wf = unique("keyed-branches");
+        let spec = FlowSpec::define(&wf, 1).step("split").spawn_combine("collect").build().unwrap();
+        client.register(&spec).await.unwrap();
+
+        let worker = Worker::new(client.clone(), "rs-it-keyed")
+            .options(opts())
+            .handle(&wf, "split", |v: Value| async move {
+                for (sku, qty) in [("x", 4), ("y", 5)] {
+                    Step::create_keyed(sku, Line { sku: sku.into(), qty })?.then_apply(price);
+                }
+                Ok(v)
+            })
+            .combine(&wf, "collect", |c: Combine| async move {
+                let priced: std::collections::HashMap<String, Priced> = c.items_as()?;
+                let mut out = c.base().clone();
+                out["x"] = json!(priced["x"].amount);
+                out["y"] = json!(priced["y"].amount);
+                Ok(out)
+            })
+            .branch_steps(&wf, BranchSteps::new().handle(price))
+            .start()
+            .await
+            .unwrap();
+
+        let id = client.start(&spec, &json!({"order": "K-1"})).await.unwrap();
+        let view = client.await_completion(&id, Duration::from_secs(30)).await.unwrap();
+        worker.close().await;
+
+        assert_eq!(view.status, "COMPLETED", "{view:?}");
+        assert_eq!(view.context["order"], "K-1");
+        assert_eq!(view.context["x"], 40);
+        assert_eq!(view.context["y"], 50);
+    }
+}
