@@ -130,7 +130,7 @@ impl GraphBuilder {
         GraphBuilder { root: None, nodes: Vec::new(), error: None }
     }
 
-    fn fail(mut self, msg: impl Into<String>) -> Self {
+    pub(crate) fn fail(mut self, msg: impl Into<String>) -> Self {
         if self.error.is_none() {
             self.error = Some(msg.into());
         }
@@ -282,7 +282,7 @@ impl GraphBuilder {
         self.push(Node::Choose { cases: out })
     }
 
-    /// The queue for the step just added (task, effect, gate, or a combine). Defaults to the
+    /// The queue for the step just added (task, effect, gate, a combine, or a loop's condition). Defaults to the
     /// workflow's default queue.
     pub fn queue(mut self, queue: impl Into<String>) -> Self {
         match self.last_worker_step() {
@@ -344,6 +344,7 @@ impl GraphBuilder {
         match self.nodes.last_mut()? {
             Node::Task { step, .. } | Node::Gate { step } => Some(step),
             Node::Fork { combine, .. } | Node::ForEach { combine, .. } => Some(combine),
+            Node::DoWhile { cond, .. } => Some(cond),
             _ => None,
         }
     }

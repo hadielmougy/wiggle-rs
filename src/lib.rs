@@ -16,6 +16,10 @@
 //!   graph, then polls, runs and reports. Handlers are typed: their input is decoded from the
 //!   step's JSON context with serde and their output encoded back, like the Java client's typed
 //!   handler methods.
+//! * [`Wiggle::define`] -- the typed flow API: a workflow written as a chain of the functions that
+//!   implement its steps (`then_apply`, `then_filter`, [`Wiggle::all_of`]`(..).combine(..)`,
+//!   [`Wiggle::one_of`], ...), checked by the compiler, carrying its handlers for
+//!   [`Worker::flow`].
 //! * [`Step`] -- the running step's identity (attempt, instance, forEach base/item index) and
 //!   [`Step::emit`] for domain events, the equivalent of Java's `Step.current()`.
 //!
@@ -64,6 +68,7 @@ mod error;
 mod flow;
 mod retry;
 mod step;
+mod typed;
 mod value;
 mod worker;
 
@@ -82,6 +87,9 @@ pub use error::{Error, Result, StepError};
 pub use flow::{Branch, Case, FlowSpec, ForEachStage, ForkStage, GraphBuilder};
 pub use retry::RetryPolicy;
 pub use step::Step;
+pub use typed::{
+    AllOf, Flow, FlowDefaults, Fork2, Fork3, Fork4, Fork5, Fork6, Fork7, Fork8, ForkN, Items, Wiggle, WiggleFlow,
+};
 pub use worker::{Combine, Compensation, RunningWorker, Worker, WorkerOptions};
 
 /// The instance context: a JSON value flowing through the steps (an object at the top level).

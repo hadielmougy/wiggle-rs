@@ -204,6 +204,63 @@ or a compensator on a step not declared compensable, is refused.
 `item_index()`, `item_map_key()` — and `Step::emit(type, payload)`, which buffers a domain event that
 is committed to the event log **if and only if** the attempt completes.
 
+## Typed flows
+
+The counterpart of the Java client's `Wiggle.allOf` / `WiggleFlow`: a workflow written as a chain
+of the very functions that implement its steps, checked by the compiler. Each step's input type is
+the previous step's output type, and a fork's combine takes one parameter per arm, in arm order.
+
+```rust
+use wiggle::{StepError, Wiggle, Worker};
+
+async fn validate(o: Order) -> Result<Order, StepError> { /* ... */ }
+async fn in_stock(o: Order) -> Result<bool, StepError> { /* ... */ }
+async fn charge(o: Order) -> Result<Payment, StepError> { /* ... */ }
+async fn label(o: Order) -> Result<Shipment, StepError> { /* ... */ }
+async fn settle(p: Payment, s: Shipment) -> Result<Receipt, StepError> { /* ... */ }
+async fn notify(r: Receipt) -> Result<(), StepError> { /* ... */ }
+
+let order = Wiggle::define("order-fulfilment", 1, |f| {
+    let validated = f.then_apply(validate).then_filter(in_stock);
+
+    let payment = validated.then_apply(charge);       // continuing `validated` twice
+    let shipping = validated.then_apply(label);       // is the fan-out
+
+    Wiggle::all_of((payment, shipping))
+        .combine(settle)                               // fn(Payment, Shipment)
+        .then_accept(notify)
+})?;
+
+client.register(&order).await?;
+let worker = Worker::new(client.clone(), "orders-1").flow(&order).start().await?;
+```
+
+- **Step names** come from the functions (`validate`, `in_stock`); pass `fn` items, not closures.
+  A closure, or a step that must match an existing graph's name, is named with
+  `.named("in-stock")`. `.queue(..)` and `.retry(..)` tune the step just added.
+- **Handlers travel with the flow**: Java finds handler methods by reflection; here the functions
+  are kept in the `Flow`, and `Worker::flow(&flow)` binds all of them under the same names.
+- **Handles are not futures.** Nothing runs at definition time. A handle continued twice is a
+  fan-out; a split that never reaches `all_of` fails the definition, naming both dangling ends.
+  So does a fan-out with no combine, arms that do not share a fork point, and two arms ending at
+  steps with the same name.
+
+| Call | Meaning |
+|---|---|
+| `then_apply(f)` / `apply(f)` | a task: `f(T) -> R`; the flow continues as `R` |
+| `then_accept(f)` | a side effect: `f(T) -> ()`; the context is unchanged |
+| `then_filter(f)` | a gate: `f(T) -> bool` |
+| `.compensate_with(undo)` | declares the task just added compensable, with `undo` as its compensator |
+| `Wiggle::all_of((a, b, ..)).combine(f)` | 2–8 arms; `f(A, B, ..)` returns the complete post-join context, and `Step::base()` is the pre-fork context |
+| `Wiggle::all_of_n(vec![..]).combine(f)` | any number of same-typed arms; `f(Vec<T>)` |
+| `Wiggle::one_of(vec![f.when(g).then_apply(..), f.otherwise().then_apply(..)])` | exactly one arm runs; the arms must end at one type (use `.cast::<R>()`) |
+| `then_for_each(key, \|item\| item.then_apply(..)).combine(f)` | one branch per element; `f(Vec<X>)` (or `combine_map` for a map input) |
+| `repeat_while(cond, \|b\| ..)` / `repeat_while_max(cond, n, \|b\| ..)` | a do-while loop |
+| `then_sleep(d)`, `then_await(signal)`, `then_await_or(signal, d, \|esc\| ..)`, `then_sub_flow::<R>(node, wf)` | timers, signals, sub-workflows |
+
+`Wiggle::flow(name, version).default_queue(..).default_retry(..).define(..)` sets workflow-wide
+defaults. A typed flow compiles to exactly the definition the builder produces for the same shape.
+
 ## Client API
 
 ```text
@@ -237,7 +294,8 @@ WIGGLE_TEST_URL=localhost:8080 cargo test --test integration  # end-to-end again
 
 - **Execution mode is SERVER only**: the worker runs one step per claim and hands back
   (no local step chaining / `LOCAL_SYNC` / `LOCAL_ASYNC`).
-- **Not ported from the Java client**: the typed method-reference flow API (`Wiggle.allOf`,
-  `thenApply`), `@ForFlow` handler objects matched by reflection (bind with `handle(..)` instead),
-  run-time branch creation (`Step.create`), queue criteria polls, and cross-instance batching.
+- **Not ported from the Java client**: `@ForFlow` handler objects matched by reflection (bind with
+  `handle(..)`, or let a typed flow carry its handlers), step-contract interfaces, run-time branch
+  creation (`Step.create`) and its spawn combine, `Items` accessor references (a forEach names its
+  key as a string), queue criteria polls, and cross-instance batching.
 - **Toolchain**: `Cargo.lock` pins a few transitive dependencies so the crate builds on Rust 1.82.

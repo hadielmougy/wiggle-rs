@@ -24,7 +24,7 @@ pub(crate) struct Scope {
     base: Option<Value>,
     item_index: Option<i64>,
     item_map_key: Option<String>,
-    emitted: Mutex<Vec<EmittedEvent>>,
+    emitted: Arc<Mutex<Vec<EmittedEvent>>>,
 }
 
 impl Scope {
@@ -38,12 +38,32 @@ impl Scope {
             base: task.base_context.clone(),
             item_index: task.base_context.as_ref().map(|_| task.item_index),
             item_map_key: task.item_map_key.clone(),
-            emitted: Mutex::new(Vec::new()),
+            emitted: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
     pub(crate) fn drain(&self) -> Vec<EmittedEvent> {
         std::mem::take(&mut *self.emitted.lock().expect("emitted lock"))
+    }
+
+    /// The running step's scope with `base` as [`Step::base`]: a combine sees the context from
+    /// before the fan-out there. Events emitted under it still ride the running step's report.
+    pub(crate) fn rebased(base: Value) -> Option<Arc<Scope>> {
+        CURRENT
+            .try_with(|s| {
+                Arc::new(Scope {
+                    attempt: s.attempt,
+                    name: s.name.clone(),
+                    instance_id: s.instance_id.clone(),
+                    workflow: s.workflow.clone(),
+                    correlation_id: s.correlation_id.clone(),
+                    base: Some(base),
+                    item_index: s.item_index,
+                    item_map_key: s.item_map_key.clone(),
+                    emitted: s.emitted.clone(),
+                })
+            })
+            .ok()
     }
 
     pub(crate) async fn run<F: Future>(self: &Arc<Self>, fut: F) -> F::Output {

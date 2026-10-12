@@ -95,13 +95,23 @@ async fn linear_flow_with_gate_effect_and_events() {
     assert_eq!(gated.termination_reason.as_deref(), Some("gated:in-stock"));
 
     // The emitted event was committed with the step that emitted it.
+    // The feed may trail the instance's state briefly, so read it until the event shows up.
     let consumer = unique("feed");
-    let events = client.poll_events(&consumer, 1000, Duration::from_millis(200), -1).await.unwrap();
-    let charged: Vec<_> =
-        events.iter().filter(|e| e.instance_id == ok.id && e.event_type == "order.charged").collect();
-    assert_eq!(charged.len(), 1, "{events:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    let charged = loop {
+        let batch = client.poll_events(&consumer, 1000, Duration::from_millis(200), -1).await.unwrap();
+        if let Some(last) = batch.last() {
+            client.ack_events(&consumer, &last.cursor).await.unwrap();
+        }
+        seen.extend(batch);
+        let hits: Vec<_> = seen.iter().filter(|e| e.instance_id == ok.id && e.event_type == "order.charged").collect();
+        if !hits.is_empty() || std::time::Instant::now() > deadline {
+            break hits;
+        }
+    };
+    assert_eq!(charged.len(), 1, "{seen:?}");
     assert_eq!(charged[0].payload["orderId"], "A-1");
-    client.ack_events(&consumer, &charged[0].cursor).await.unwrap();
 }
 
 #[tokio::test]
@@ -216,4 +226,98 @@ async fn worker_refuses_mismatched_bindings() {
         .err()
         .expect("an unregistered workflow must be refused");
     assert!(err.to_string().contains("is not registered"), "{err}");
+}
+
+mod typed {
+    use super::*;
+    use wiggle::Wiggle;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Trip {
+        id: String,
+        vip: bool,
+        nights: Vec<u32>,
+    }
+    #[derive(Serialize, Deserialize)]
+    struct Air {
+        seat: String,
+    }
+    #[derive(Serialize, Deserialize)]
+    struct Hotel {
+        room: String,
+    }
+
+    type R<T> = Result<T, StepError>;
+
+    async fn prep(t: Trip) -> R<Trip> {
+        Ok(t)
+    }
+    async fn book_air(t: Trip) -> R<Air> {
+        Ok(Air { seat: format!("{}-1A", t.id) })
+    }
+    async fn book_hotel(t: Trip) -> R<Hotel> {
+        Ok(Hotel { room: format!("{}-101", t.id) })
+    }
+    async fn merge(a: Air, h: Hotel) -> R<Value> {
+        // The pre-fork context is the combine's base.
+        let mut base = Step::base().expect("a combine has a base");
+        base["seat"] = json!(a.seat);
+        base["room"] = json!(h.room);
+        Ok(base)
+    }
+    async fn rate(n: u32) -> R<u32> {
+        Ok(n * 100)
+    }
+    async fn bill(rates: Vec<u32>) -> R<Value> {
+        let mut base = Step::base().expect("a combine has a base");
+        base["bill"] = json!(rates.iter().sum::<u32>());
+        Ok(base)
+    }
+    async fn is_vip(t: Value) -> R<bool> {
+        Ok(t["vip"] == true)
+    }
+    async fn concierge(mut t: Value) -> R<Value> {
+        t["service"] = json!("concierge");
+        Ok(t)
+    }
+    async fn self_service(mut t: Value) -> R<Value> {
+        t["service"] = json!("self");
+        Ok(t)
+    }
+
+    #[tokio::test]
+    async fn typed_flow_binds_its_own_handlers() {
+        let Some(client) = client().await else { return };
+        let wf = unique("trip");
+        let flow = Wiggle::define(&wf, 1, |f| {
+            let prepped = f.then_apply(prep);
+            let air = prepped.then_apply(book_air);
+            let hotel = prepped.then_apply(book_hotel);
+            let joined = Wiggle::all_of((air, hotel))
+                .combine(merge)
+                .then_for_each("nights", |night| night.then_apply(rate))
+                .combine(bill);
+            let vip = joined.when(is_vip).then_apply(concierge);
+            let rest = joined.otherwise().then_apply(self_service);
+            Wiggle::one_of(vec![vip, rest])
+        })
+        .unwrap();
+        client.register(&flow).await.unwrap();
+
+        let worker = Worker::new(client.clone(), "rs-it-typed").options(opts()).flow(&flow).start().await.unwrap();
+        let a = client.start(&flow, &Trip { id: "T1".into(), vip: true, nights: vec![1, 2] }).await.unwrap();
+        let b = client.start(&flow, &Trip { id: "T2".into(), vip: false, nights: vec![3] }).await.unwrap();
+        let a = client.await_completion(&a, Duration::from_secs(30)).await.unwrap();
+        let b = client.await_completion(&b, Duration::from_secs(30)).await.unwrap();
+        worker.shutdown().await;
+
+        assert_eq!(a.status, "COMPLETED", "{a:?}");
+        assert_eq!(a.context["seat"], "T1-1A");
+        assert_eq!(a.context["room"], "T1-101");
+        assert_eq!(a.context["bill"], 300);
+        assert_eq!(a.context["service"], "concierge");
+        assert_eq!(b.status, "COMPLETED", "{b:?}");
+        assert_eq!(b.context["bill"], 300);
+        assert_eq!(b.context["service"], "self");
+    }
 }

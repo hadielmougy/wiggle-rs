@@ -23,16 +23,16 @@ const COMPENSATE_SUFFIX: &str = "#compensate";
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-enum Outcome {
+pub(crate) enum Outcome {
     /// A task's complete next context; `None` leaves the context unchanged.
     Merge(Option<Value>),
     Predicate(bool),
 }
 
-type Handler = Arc<dyn Fn(Task) -> BoxFuture<std::result::Result<Outcome, StepError>> + Send + Sync>;
+pub(crate) type Handler = Arc<dyn Fn(Task) -> BoxFuture<std::result::Result<Outcome, StepError>> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Task,
     Gate,
     Combine,
@@ -141,7 +141,7 @@ pub struct Combine {
 }
 
 impl Combine {
-    fn of(task: &Task) -> Combine {
+    pub(crate) fn of(task: &Task) -> Combine {
         let mut map = match &task.context {
             Value::Object(m) => m.clone(),
             _ => Map::new(),
@@ -226,16 +226,83 @@ impl Compensation {
     }
 }
 
-fn decode<T: DeserializeOwned>(value: Value, what: &str) -> std::result::Result<T, StepError> {
+pub(crate) fn decode<T: DeserializeOwned>(value: Value, what: &str) -> std::result::Result<T, StepError> {
     serde_json::from_value(value).map_err(|e| StepError::permanent(format!("cannot decode {what}: {e}")))
 }
 
-fn encode<O: Serialize>(out: O) -> std::result::Result<Option<Value>, StepError> {
+pub(crate) fn encode<O: Serialize>(out: O) -> std::result::Result<Option<Value>, StepError> {
     match serde_json::to_value(out) {
         Ok(Value::Null) => Ok(None), // nothing returned: leave the context untouched
         Ok(v) => Ok(Some(v)),
         Err(e) => Err(StepError::permanent(format!("cannot encode the step's result: {e}"))),
     }
+}
+
+fn input<I: DeserializeOwned>(task: Task) -> std::result::Result<I, StepError> {
+    let what = format!("the context of step '{}'", task.step_name);
+    decode(task.context, &what)
+}
+
+pub(crate) fn task_handler<I, O, F, Fut>(f: F) -> Handler
+where
+    I: DeserializeOwned + Send + 'static,
+    O: Serialize + 'static,
+    F: Fn(I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<O, StepError>> + Send + 'static,
+{
+    let f = Arc::new(f);
+    Arc::new(move |task: Task| {
+        let f = f.clone();
+        Box::pin(async move { Ok(Outcome::Merge(encode(f(input(task)?).await?)?)) })
+    })
+}
+
+pub(crate) fn effect_handler<I, F, Fut>(f: F) -> Handler
+where
+    I: DeserializeOwned + Send + 'static,
+    F: Fn(I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<(), StepError>> + Send + 'static,
+{
+    let f = Arc::new(f);
+    Arc::new(move |task: Task| {
+        let f = f.clone();
+        Box::pin(async move {
+            f(input(task)?).await?;
+            Ok(Outcome::Merge(None))
+        })
+    })
+}
+
+pub(crate) fn gate_handler<I, F, Fut>(f: F) -> Handler
+where
+    I: DeserializeOwned + Send + 'static,
+    F: Fn(I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<bool, StepError>> + Send + 'static,
+{
+    let f = Arc::new(f);
+    Arc::new(move |task: Task| {
+        let f = f.clone();
+        Box::pin(async move { Ok(Outcome::Predicate(f(input(task)?).await?)) })
+    })
+}
+
+pub(crate) fn compensation_handler<F, Fut>(f: F) -> Handler
+where
+    F: Fn(Compensation) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<(), StepError>> + Send + 'static,
+{
+    let f = Arc::new(f);
+    Arc::new(move |task: Task| {
+        let f = f.clone();
+        Box::pin(async move {
+            let (input, result) = match task.context {
+                Value::Object(mut m) => (m.remove("input").unwrap_or(Value::Null), m.remove("result").unwrap_or(Value::Null)),
+                _ => (Value::Null, Value::Null),
+            };
+            f(Compensation { input, result }).await?;
+            Ok(Outcome::Merge(None))
+        })
+    })
 }
 
 /// Binds handlers to the steps of registered workflows, by name, and runs them.
@@ -283,16 +350,7 @@ impl Worker {
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = std::result::Result<O, StepError>> + Send + 'static,
     {
-        let f = Arc::new(f);
-        let what = format!("the context of step '{step}'");
-        self.bind(workflow, step, Kind::Task, Arc::new(move |task: Task| {
-            let f = f.clone();
-            let what = what.clone();
-            Box::pin(async move {
-                let input: I = decode(task.context, &what)?;
-                Ok(Outcome::Merge(encode(f(input).await?)?))
-            })
-        }))
+        self.bind(workflow, step, Kind::Task, task_handler(f))
     }
 
     /// Binds a side-effect step: the context is left unchanged.
@@ -302,17 +360,7 @@ impl Worker {
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = std::result::Result<(), StepError>> + Send + 'static,
     {
-        let f = Arc::new(f);
-        let what = format!("the context of step '{step}'");
-        self.bind(workflow, step, Kind::Task, Arc::new(move |task: Task| {
-            let f = f.clone();
-            let what = what.clone();
-            Box::pin(async move {
-                let input: I = decode(task.context, &what)?;
-                f(input).await?;
-                Ok(Outcome::Merge(None))
-            })
-        }))
+        self.bind(workflow, step, Kind::Task, effect_handler(f))
     }
 
     /// Binds a predicate step: a gate, a choose guard, or a do-while condition.
@@ -322,16 +370,7 @@ impl Worker {
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = std::result::Result<bool, StepError>> + Send + 'static,
     {
-        let f = Arc::new(f);
-        let what = format!("the context of step '{step}'");
-        self.bind(workflow, step, Kind::Gate, Arc::new(move |task: Task| {
-            let f = f.clone();
-            let what = what.clone();
-            Box::pin(async move {
-                let input: I = decode(task.context, &what)?;
-                Ok(Outcome::Predicate(f(input).await?))
-            })
-        }))
+        self.bind(workflow, step, Kind::Gate, gate_handler(f))
     }
 
     /// Binds the mandatory combine after a fork or forEach. `f` returns the **complete** post-join
@@ -360,21 +399,16 @@ impl Worker {
         F: Fn(Compensation) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = std::result::Result<(), StepError>> + Send + 'static,
     {
-        let f = Arc::new(f);
-        self.bind(workflow, step, Kind::Compensate, Arc::new(move |task: Task| {
-            let f = f.clone();
-            Box::pin(async move {
-                let (input, result) = match task.context {
-                    Value::Object(mut m) => (
-                        m.remove("input").unwrap_or(Value::Null),
-                        m.remove("result").unwrap_or(Value::Null),
-                    ),
-                    _ => (Value::Null, Value::Null),
-                };
-                f(Compensation { input, result }).await?;
-                Ok(Outcome::Merge(None))
-            })
-        }))
+        self.bind(workflow, step, Kind::Compensate, compensation_handler(f))
+    }
+
+    /// Binds every handler a typed [`Flow`](crate::Flow) was defined with -- each step, gate,
+    /// combine and compensator -- under the step names the flow gave them.
+    pub fn flow(mut self, flow: &crate::typed::Flow) -> Self {
+        for b in flow.bindings() {
+            self = self.bind(flow.name(), &b.step, b.kind, b.handler.clone());
+        }
+        self
     }
 
     /// Reconciles every binding against its registered graph -- a mistyped step name, a kind
