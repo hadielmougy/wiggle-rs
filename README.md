@@ -69,7 +69,7 @@ This is the same shape as the Java client's typed flows (see [Typed flows](#type
 lower-level [topology builder](#topology) names steps as strings and binds handlers to them
 separately; the two produce identical definitions.
 
-Run the bundled example (topology builder, forks and run-time branches) against a server on `:8080`:
+Run the bundled example (a typed flow with a fork and its combine) against a server on `:8080`:
 
 ```bash
 WIGGLE_URL=localhost:8080 cargo run --example order
