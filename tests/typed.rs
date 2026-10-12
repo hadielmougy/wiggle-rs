@@ -211,6 +211,48 @@ fn workflow_defaults_match_the_builder() {
     assert!(err.to_string().contains("default_queue()"), "{err}");
 }
 
+async fn fulfil(t: Trip) -> R<Trip> {
+    Ok(t)
+}
+async fn summarise(results: Vec<Value>) -> R<Value> {
+    Ok(json!({"count": results.len()}))
+}
+async fn by_key(results: std::collections::BTreeMap<String, Value>) -> R<Value> {
+    Ok(json!({"keys": results.keys().collect::<Vec<_>>()}))
+}
+
+#[test]
+fn combine_after_a_step_is_a_spawn_combine() {
+    let retry = RetryPolicy::fixed(2, Duration::from_millis(10));
+    let typed = FlowSpec::define("dyn", 1, |f| {
+        f.then_apply(prep).then_apply(fulfil).combine(summarise).queue("collect").retry(retry).then_apply(book)
+    })
+    .unwrap();
+    let built = GraphBuilder::define("dyn", 1)
+        .step("prep")
+        .step("fulfil")
+        .spawn_combine("summarise")
+        .queue("collect")
+        .retry(retry)
+        .step("book")
+        .build()
+        .unwrap();
+    assert_eq!(typed.definition(), built.definition());
+    assert!(typed.steps().contains(&"summarise".to_string()));
+
+    let keyed = FlowSpec::define("dyn", 1, |f| f.then_apply(fulfil).combine_map(by_key)).unwrap();
+    assert_eq!(by_name(&nodes(&keyed), "by_key")["collectKey"], "__spawn__fulfil");
+}
+
+#[test]
+fn combine_must_follow_the_spawning_step() {
+    let err = FlowSpec::define("dyn", 1, |f| f.then_filter(is_vip).combine(summarise)).unwrap_err();
+    assert!(err.to_string().contains("combine() must directly follow"), "{err}");
+
+    let err = FlowSpec::define("dyn", 1, |f: wiggle::WiggleFlow<Trip>| f.combine(summarise)).unwrap_err();
+    assert!(err.to_string().contains("combine() must directly follow"), "{err}");
+}
+
 #[test]
 fn closures_take_their_name_from_named() {
     let flow = FlowSpec::define("c", 1, |f| {

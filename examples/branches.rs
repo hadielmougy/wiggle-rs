@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use wiggle::{BranchSteps, Client, Combine, Compensation, GraphBuilder, Step, StepError, Worker};
+use wiggle::{BranchSteps, Client, Compensation, FlowSpec, Step, StepError, WiggleFlow, Worker};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,11 +72,10 @@ async fn ship(mut i: Item) -> Result<Item, StepError> {
     Ok(i)
 }
 
-/// The spawn combine: every branch's result in creation order. Its base is what `fulfil`
-/// returned, and its return is the complete next context.
-async fn summarise(c: Combine) -> Result<serde_json::Value, StepError> {
-    let order: Order = c.base_as()?;
-    let items: Vec<Item> = c.items_as()?;
+/// The combine after `fulfil`: every branch's result in creation order. `Step::base` is what
+/// `fulfil` returned, and the return is the complete next context.
+async fn summarise(items: Vec<Item>) -> Result<serde_json::Value, StepError> {
+    let order: Order = Step::base_as()?.ok_or_else(|| StepError::permanent("a combine has a base"))?;
     let lines: Vec<String> = items
         .iter()
         .map(|i| format!("{}: {}", i.sku, i.via.as_deref().unwrap_or("out of stock")))
@@ -90,20 +89,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("WIGGLE_URL").unwrap_or_else(|_| "localhost:8080".into());
     let client = Client::connect(&url).await?;
 
-    // `fulfil` is a spawning step: the combine directly after it collects the branches it opens.
-    let spec = GraphBuilder::define("rs-order-branches", 1)
-        .step("fulfil")
-        .spawn_combine("summarise")
-        .build()?;
+    // A combine directly after a step makes it a spawning step: the combine collects the branches
+    // `fulfil` opens -- Java's `f.thenApply(s::fulfil).combine(s::summarise)`.
+    let spec = FlowSpec::define("rs-order-branches", 1, |f: WiggleFlow<Order>| f.then_apply(fulfil).combine(summarise))?;
     client.register(&spec).await?;
 
-    let wf = spec.name();
     let worker = Worker::new(client.clone(), "rs-branches-example")
-        .handle(wf, "fulfil", fulfil)
-        .combine(wf, "summarise", summarise)
+        .flow(&spec)
         // The branch steps are in no graph, so they are bound by function rather than reconciled.
         .branch_steps(
-            wf,
+            spec.name(),
             BranchSteps::new()
                 .handle(link)
                 .handle(reserve)

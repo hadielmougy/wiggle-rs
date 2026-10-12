@@ -545,4 +545,46 @@ mod branches {
         assert_eq!(view.status, "COMPENSATED", "{view:?}");
         assert_eq!(UNDONE.load(Ordering::SeqCst), 2, "each branch's charge was undone");
     }
+
+    #[derive(Serialize, Deserialize)]
+    struct Basket {
+        id: String,
+        lines: Vec<Line>,
+    }
+
+    async fn open_lines(b: Basket) -> R<Basket> {
+        for line in &b.lines {
+            Step::create(Line { sku: line.sku.clone(), qty: line.qty })?.then_apply(price).then_apply(add_tax);
+        }
+        Ok(b)
+    }
+    async fn total_lines(priced: Vec<Priced>) -> R<Value> {
+        let base: Basket = Step::base_as()?.expect("a spawn combine has a base");
+        Ok(json!({"id": base.id, "total": priced.iter().map(|p| p.amount).sum::<u32>()}))
+    }
+
+    #[tokio::test]
+    async fn typed_combine_after_a_step_collects_its_branches() {
+        let Some(client) = client().await else { return };
+        let wf = unique("typed-branches");
+        let flow = FlowSpec::define(&wf, 1, |f: wiggle::WiggleFlow<Basket>| f.then_apply(open_lines).combine(total_lines))
+            .unwrap();
+        client.register(&flow).await.unwrap();
+
+        let worker = Worker::new(client.clone(), "rs-it-typed-branches")
+            .options(opts())
+            .flow(&flow)
+            .branch_steps(&wf, BranchSteps::new().handle(price).handle(add_tax))
+            .start()
+            .await
+            .unwrap();
+
+        let basket = json!({"id": "K-9", "lines": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 4}]});
+        let id = client.start(&flow, &basket).await.unwrap();
+        let view = client.await_completion(&id, Duration::from_secs(30)).await.unwrap();
+        worker.close().await;
+
+        assert_eq!(view.status, "COMPLETED", "{view:?}");
+        assert_eq!(view.context, json!({"id": "K-9", "total": 52}));
+    }
 }

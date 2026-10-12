@@ -161,6 +161,7 @@ impl Step {
     /// Like [`emit`](Self::emit), the branch is buffered and rides the step's report: it runs once
     /// the step completes, and an attempt that fails leaves nothing behind. Its result reaches the
     /// combine after the step. Only a spawning step (one followed directly by a
+    /// [`combine`](crate::WiggleFlow::combine) in a typed flow, or a
     /// [`spawn_combine`](crate::GraphBuilder::spawn_combine)), or that combine, may create
     /// branches. The steps chained on are named after their functions and bound on the worker that
     /// runs them with [`Worker::branch_steps`](crate::Worker::branch_steps).

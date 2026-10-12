@@ -216,16 +216,16 @@ is committed to the event log **if and only if** the attempt completes.
 
 ### Run-time branches
 
-The counterpart of Java's `Step.create` / `worker.Branch`. A step followed by `spawn_combine(..)` may
+The counterpart of Java's `Step.create` / `worker.Branch`. A step followed directly by a combine
+(`then_apply(split).combine(collect)` in a typed flow, `spawn_combine(..)` in `GraphBuilder`) may
 open branches from its handler; each is an isolated context with steps chained on **by function**,
 like a typed flow. The branches ride the step's report (a failed attempt leaves none behind) and
 their results reach the combine — a list in creation order, or a map by key with
 `Step::create_keyed(key, input)`.
 
 ```rust
-use wiggle::{BranchSteps, Combine, Step, StepError, Worker};
+use wiggle::{BranchSteps, FlowSpec, Step, StepError, WiggleFlow, Worker};
 
-// topology: GraphBuilder::define("orders", 1).step("split").spawn_combine("collect")
 async fn split(o: Order) -> Result<Order, StepError> {
     for item in &o.items {
         Step::create(item.clone())?
@@ -236,10 +236,15 @@ async fn split(o: Order) -> Result<Order, StepError> {
     Ok(o)
 }
 
+// Every branch's result in creation order; Step::base() is what `split` returned.
+async fn collect(items: Vec<Item>) -> Result<Order, StepError> { /* ... */ }
+
+// Java: f.thenApply(s::split).combine(s::collect)
+let orders = FlowSpec::define("orders", 1, |f: WiggleFlow<Order>| f.then_apply(split).combine(collect))?;
+
 let worker = Worker::new(client.clone(), "orders-1")
-    .handle("orders", "split", split)
-    .combine("orders", "collect", |c: Combine| async move { /* c.items_as() */ })
-    .branch_steps("orders", BranchSteps::new()
+    .flow(&orders)                             // split and collect
+    .branch_steps("orders", BranchSteps::new() // the steps the branches chain on
         .handle(reserve)
         .gate(in_stock)
         .handle(ship)
@@ -313,6 +318,7 @@ let worker = Worker::new(client.clone(), "orders-1").flow(&order).start().await?
 | `Wiggle::all_of_n(vec![..]).combine(f)` | any number of same-typed arms; `f(Vec<T>)` |
 | `Wiggle::one_of(vec![f.when(g).then_apply(..), f.otherwise().then_apply(..)])` | exactly one arm runs; the arms must end at one type (use `.as_type::<R>()`, Java's `as(R.class)`) |
 | `then_for_each(key, \|item\| item.then_apply(..)).combine(f)` | one branch per element; `f(Vec<X>)` (or `combine_map` for a map input) |
+| `then_apply(f).combine(g)` / `.combine_map(g)` | `f` opens branches at run time with `Step::create`; `g(Vec<X>)` (or a map by key) collects them — see [Run-time branches](#run-time-branches) |
 | `repeat_while(cond, \|b\| ..)` / `repeat_while_max(cond, n, \|b\| ..)` | a do-while loop |
 | `then_sleep(d)`, `then_await(signal)`, `then_await_or(signal, d, \|esc\| ..)`, `then_sub_flow::<R>(node, wf)` | timers, signals, sub-workflows |
 
@@ -369,6 +375,7 @@ binds closures.
 | `Workflow.define(name, v)` → `GraphBuilder` | `GraphBuilder::define(name, v)` |
 | `thenSleep(name, d)` / `thenAwait(signal, timeout[, escalation])` | `then_sleep_named` / `then_await_timeout` / `then_await_or` |
 | `thenForEach(name, key, body)` | `then_for_each_named(name, key, body)` |
+| `f.thenApply(s::fulfil).combine(s::summarise)` | `f.then_apply(fulfil).combine(summarise)` (a map of keyed branches: `combine_map`) |
 | `repeatWhile(cond, max, body)` | `repeat_while_max(cond, max, body)` |
 | `thenApplyCompensable(factory)` | `then_apply_compensable(step, undo)` |
 | `Wiggle.allOf(a, b, ..)` / `allOf(arms...)` | `Wiggle::all_of((a, b, ..))` / `Wiggle::all_of_n(vec![..])` |

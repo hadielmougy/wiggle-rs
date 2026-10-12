@@ -179,6 +179,8 @@ enum Op {
     ForEach { name: String, items_key: String, body: usize, combine: StepDef },
     Loop { cond: StepDef, max_iterations: Option<u32>, body: usize },
     Fork { arms: Vec<Vec<usize>>, combine: Option<StepDef> },
+    /// The combine of the branches its parent task creates at run time (`Step::create`).
+    SpawnCombine { combine: StepDef },
     /// The head of a `one_of` arm; `None` is the otherwise.
     Guard { guard: Option<StepDef> },
     Choice { cases: Vec<Vec<usize>> },
@@ -234,6 +236,7 @@ impl Arena {
             Op::ForEach { combine, .. } => combine.name.clone().ok(),
             Op::Loop { cond, .. } => cond.name.clone().ok(),
             Op::Fork { combine, .. } => combine.as_ref().and_then(|c| c.name.clone().ok()),
+            Op::SpawnCombine { combine } => combine.name.clone().ok(),
             Op::Root | Op::Guard { .. } | Op::Choice { .. } | Op::Failed => None,
         }
     }
@@ -252,6 +255,7 @@ impl Arena {
             Op::ForEach { combine, .. } => Some(combine),
             Op::Loop { cond, .. } => Some(cond),
             Op::Fork { combine, .. } => combine.as_mut(),
+            Op::SpawnCombine { combine } => Some(combine),
             Op::Guard { guard } => guard.as_mut(),
             _ => None,
         }
@@ -398,6 +402,7 @@ impl Arena {
                 Op::ForEach { combine, .. } => push(combine),
                 Op::Loop { cond, .. } => push(cond),
                 Op::Fork { combine: Some(c), .. } => push(c),
+                Op::SpawnCombine { combine } => push(combine),
                 Op::Guard { guard: Some(g) } => push(g),
                 _ => {}
             }
@@ -702,6 +707,45 @@ impl<T: DeserializeOwned + Send + 'static> WiggleFlow<T> {
         self.record(Op::Loop { cond, max_iterations, body: root })
     }
 
+    /// Makes the step just added a **spawning step** -- its handler may open branches at run time
+    /// with [`Step::create`](crate::Step::create) -- and records the combine they rejoin at, like
+    /// Java's `thenApply(s::fulfil).combine(s::summarise)`. `combine` receives every branch's
+    /// result in creation order; the spawning step's return is [`Step::base`](crate::Step::base),
+    /// and the combine's return is the complete next context. It may itself create branches,
+    /// starting another round. Must directly follow [`then_apply`](Self::then_apply) or
+    /// [`then_accept`](Self::then_accept).
+    pub fn combine<X, R, F, Fut>(&self, combine: F) -> WiggleFlow<R>
+    where
+        X: DeserializeOwned + Send + 'static,
+        R: Serialize + 'static,
+        F: Fn(Vec<X>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<R, StepError>> + Send + 'static,
+    {
+        self.spawn_combine(StepDef::new::<F>(Kind::Combine, collect_handler(combine)))
+    }
+
+    /// [`combine`](Self::combine) for branches opened with
+    /// [`Step::create_keyed`](crate::Step::create_keyed): their results keyed like the branches.
+    pub fn combine_map<X, R, F, Fut>(&self, combine: F) -> WiggleFlow<R>
+    where
+        X: DeserializeOwned + Send + 'static,
+        R: Serialize + 'static,
+        F: Fn(BTreeMap<String, X>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<R, StepError>> + Send + 'static,
+    {
+        self.spawn_combine(StepDef::new::<F>(Kind::Combine, collect_handler(combine)))
+    }
+
+    fn spawn_combine<R>(&self, combine: StepDef) -> WiggleFlow<R> {
+        if !matches!(self.plan.borrow().nodes[self.node].op, Op::Task { .. }) {
+            let mut plan = self.plan.borrow_mut();
+            let e = "combine() must directly follow the step that creates the branches it combines: \
+                     then_apply() or then_accept()";
+            return WiggleFlow::at(self.plan.clone(), plan.failed(self.node, e.into()));
+        }
+        self.record(Op::SpawnCombine { combine })
+    }
+
     /// A compensable task: `step` runs like [`then_apply`](Self::then_apply), and if the instance
     /// later fails, `undo` runs in the reverse pass with the step's input/result snapshots. The
     /// counterpart of Java's `thenApplyCompensable`; the step is named after `step`.
@@ -959,6 +1003,7 @@ enum Replay {
     ForEach { name: String, items_key: String, body: usize, combine: Tuning },
     Loop { cond: Tuning, max_iterations: Option<u32>, body: usize },
     Fork { arms: Vec<Vec<usize>>, combine: Option<Tuning> },
+    SpawnCombine { combine: Tuning },
     Choice { cases: Vec<Vec<usize>> },
     Stray(&'static str),
     Nothing,
@@ -1019,6 +1064,7 @@ fn apply(plan: &Rc<RefCell<Arena>>, id: usize, b: GraphBuilder) -> GraphBuilder 
                 Replay::Loop { cond: cond.into(), max_iterations: *max_iterations, body: *body }
             }
             Op::Fork { arms, combine } => Replay::Fork { arms: arms.clone(), combine: combine.as_ref().map(Tuning::from) },
+            Op::SpawnCombine { combine } => Replay::SpawnCombine { combine: combine.into() },
             Op::Choice { cases } => Replay::Choice { cases: cases.clone() },
             Op::Guard { .. } => Replay::Stray("when()/otherwise() opens an arm of Wiggle::one_of(..), not a step of its own"),
             Op::Root | Op::Failed => Replay::Nothing,
@@ -1065,6 +1111,10 @@ fn apply(plan: &Rc<RefCell<Arena>>, id: usize, b: GraphBuilder) -> GraphBuilder 
                 None => b.do_while(name, body),
             };
             tuned(b, cond.queue, cond.retry)
+        }
+        Replay::SpawnCombine { combine } => {
+            let (b, name) = named(b, combine.name);
+            tuned(b.spawn_combine(name), combine.queue, combine.retry)
         }
         Replay::Fork { combine: None, .. } => b.fail("an all_of fan-out has no combine; follow it with combine(..)"),
         Replay::Fork { arms, combine: Some(combine) } => {
