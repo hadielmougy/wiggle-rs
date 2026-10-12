@@ -501,7 +501,7 @@ fn fork_point(leaves: &[(Rc<RefCell<Arena>>, usize)]) -> (Rc<RefCell<Arena>>, us
 
 /// The step name a function gives: the last segment of its path (`orders::in_stock` names
 /// `in_stock`). A closure has none.
-fn fn_name<F>() -> std::result::Result<String, String> {
+pub(crate) fn fn_name<F>() -> std::result::Result<String, String> {
     let full = std::any::type_name::<F>();
     if full.contains("{{closure}}") {
         return Err(format!(
@@ -586,8 +586,8 @@ impl<T> WiggleFlow<T> {
     }
 
     /// Reinterprets the context type from here on -- after a signal merged a payload, say, or to
-    /// make `one_of` arms agree.
-    pub fn cast<R>(self) -> WiggleFlow<R> {
+    /// make `one_of` arms agree. Java's `as(Class)`; it records nothing.
+    pub fn as_type<R>(self) -> WiggleFlow<R> {
         WiggleFlow::at(self.plan, self.node)
     }
 
@@ -760,21 +760,31 @@ impl<T: DeserializeOwned + Send + 'static> WiggleFlow<T> {
         self.record(Op::Loop { cond, max_iterations, body: root })
     }
 
-    /// Declares the task just added compensable, with `undo` as its compensator: if the instance
-    /// later fails, `undo` runs in the reverse pass with the step's input/result snapshots.
-    pub fn compensate_with<F, Fut>(self, undo: F) -> Self
+    /// A compensable task: `step` runs like [`then_apply`](Self::then_apply), and if the instance
+    /// later fails, `undo` runs in the reverse pass with the step's input/result snapshots. The
+    /// counterpart of Java's `thenApplyCompensable`; the step is named after `step`.
+    pub fn then_apply_compensable<R, F, Fut, U, UFut>(&self, step: F, undo: U) -> WiggleFlow<R>
     where
-        F: Fn(Compensation) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = std::result::Result<(), StepError>> + Send + 'static,
+        R: Serialize + 'static,
+        F: Fn(T) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<R, StepError>> + Send + 'static,
+        U: Fn(Compensation) -> UFut + Send + Sync + 'static,
+        UFut: Future<Output = std::result::Result<(), StepError>> + Send + 'static,
     {
-        {
-            let mut plan = self.plan.borrow_mut();
-            match &mut plan.nodes[self.node].op {
-                Op::Task { compensator, .. } => *compensator = Some(compensation_handler(undo)),
-                _ => plan.fail("compensate_with() must directly follow then_apply() or then_accept()".into()),
-            }
-        }
-        self
+        let def = StepDef::new::<F>(Kind::Task, task_handler(step));
+        self.record(Op::Task { step: def, compensator: Some(compensation_handler(undo)) })
+    }
+
+    /// Alias of [`then_apply_compensable`](Self::then_apply_compensable).
+    pub fn apply_compensable<R, F, Fut, U, UFut>(&self, step: F, undo: U) -> WiggleFlow<R>
+    where
+        R: Serialize + 'static,
+        F: Fn(T) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<R, StepError>> + Send + 'static,
+        U: Fn(Compensation) -> UFut + Send + Sync + 'static,
+        UFut: Future<Output = std::result::Result<(), StepError>> + Send + 'static,
+    {
+        self.then_apply_compensable(step, undo)
     }
 }
 

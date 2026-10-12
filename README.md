@@ -59,7 +59,7 @@ async fn main() -> Result<(), wiggle::Error> {
     let view = client.await_completion(&id, Duration::from_secs(30)).await?;
     println!("{} {}", view.status, view.context); // COMPLETED {...}
 
-    worker.shutdown().await;
+    worker.close().await;
     Ok(())
 }
 ```
@@ -114,6 +114,7 @@ let wf = FlowSpec::define("order-fulfilment", 1)
 | `sleep(d)` / `sleep_named(name, d)` | a server-side timer; no worker held |
 | `await_signal(name)` / `await_signal_timeout` / `await_signal_or(name, d, escalation)` | wait for `Client::signal`; on timeout fail, or run the escalation and rejoin |
 | `sub_workflow(name, workflow)` | run another workflow as a child; its result merges back |
+| `spawn_combine(name)` | makes the step just added a **spawning step** whose handler opens branches at run time (`Step::create`), rejoined at this combine |
 | `default_queue(q)` / `default_retry(p)` | workflow-wide defaults (`RetryPolicy::forever()` unless set) |
 
 Retry policies: `RetryPolicy::exponential(max, initial)`, `fixed(max, backoff)`, `none()`, `forever()`.
@@ -131,23 +132,26 @@ A decode failure fails the step permanently.
 | `gate(wf, step, f)` | `Fn(I) -> Future<Result<bool, StepError>>` | gate / choose guard / do-while condition |
 | `combine(wf, step, f)` | `Fn(Combine) -> Future<Result<O, StepError>>` | a fork / forEach combine |
 | `compensation(wf, step, f)` | `Fn(Compensation) -> Future<Result<(), StepError>>` | the undo of a `compensate()` step |
+| `branch_steps(wf, BranchSteps)` | the functions themselves | steps that run-time branches chain on (see below) |
+| `flow(&flow)` | carried by a typed `Flow` | every step of a typed flow (see [Typed flows](#typed-flows)) |
 
 `start()` **reconciles** every binding against the registered graph: a mistyped step name fails
 fast with the available names, a handler bound with the wrong kind (a task on a gate, a plain
 handler on a combine) is refused, and the worker learns which queue each step polls. Use
-`WorkerOptions::await_registration(d)` to ride out a registration race.
+`WorkerOptions::with_await_registration(d)` to ride out a registration race.
 
 ```rust
 let worker = Worker::new(client.clone(), "orders-1")
-    .options(WorkerOptions::default()
-        .concurrency(16)                     // steps in flight (default: CPUs)
-        .lease(Duration::from_secs(30))      // heartbeats extend it every half lease
-        .queues(["payments"]))               // else every queue its steps poll
+    .options(WorkerOptions::defaults()
+        .with_concurrency(16)                // steps in flight (default: CPUs)
+        .with_lease(Duration::from_secs(30)) // heartbeats extend it every half lease
+        .with_long_poll_wait(Duration::from_secs(10))
+        .with_queues(["payments"]))          // else every queue its steps poll
     .handle("order-fulfilment", "charge", charge)
     .start()
     .await?;
 // ...
-worker.shutdown().await;                     // stop polling, drain in-flight steps
+worker.close().await;                        // stop polling, drain in-flight steps
 ```
 
 ### Errors
@@ -204,6 +208,47 @@ or a compensator on a step not declared compensable, is refused.
 `item_index()`, `item_map_key()` — and `Step::emit(type, payload)`, which buffers a domain event that
 is committed to the event log **if and only if** the attempt completes.
 
+### Run-time branches
+
+The counterpart of Java's `Step.create` / `worker.Branch`. A step followed by `spawn_combine(..)` may
+open branches from its handler; each is an isolated context with steps chained on **by function**,
+like a typed flow. The branches ride the step's report (a failed attempt leaves none behind) and
+their results reach the combine — a list in creation order, or a map by key with
+`Step::create_keyed(key, input)`.
+
+```rust
+use wiggle::{BranchSteps, Combine, Step, StepError, Worker};
+
+// topology: FlowSpec::define("orders", 1).step("split").spawn_combine("collect")
+async fn split(o: Order) -> Result<Order, StepError> {
+    for item in &o.items {
+        Step::create(item)?
+            .then_apply_compensable(reserve)       // undone by the compensation below
+            .then_filter(in_stock)
+            .then_apply(ship);
+    }
+    Ok(o)
+}
+
+let worker = Worker::new(client.clone(), "orders-1")
+    .handle("orders", "split", split)
+    .combine("orders", "collect", |c: Combine| async move { /* c.items_as() */ })
+    .branch_steps("orders", BranchSteps::new()
+        .handle(reserve)
+        .gate(in_stock)
+        .handle(ship)
+        .compensation(reserve, release))
+    .start()
+    .await?;
+```
+
+A branch has the same vocabulary as a typed flow: `then_apply`, `then_apply_compensable`,
+`then_accept`, `then_filter`, `then_sleep`, `then_await`, `then_sub_flow`,
+`then_all_of(|a| a.arm(..).arm(..)).combine(f)`, `then_one_of(|a| a.arm(|b| b.when(g)..)..)`,
+`repeat_while`, and `combine(f)` to make a branch step a spawning step of its own. `.named(..)`,
+`.queue(..)` and `.retry(..)` tune the step just added. `branch::Branch` is distinct from the
+topology's `wiggle::Branch` (Java keeps them in separate packages, `worker` and `flow`).
+
 ## Typed flows
 
 The counterpart of the Java client's `Wiggle.allOf` / `WiggleFlow`: a workflow written as a chain
@@ -250,10 +295,10 @@ let worker = Worker::new(client.clone(), "orders-1").flow(&order).start().await?
 | `then_apply(f)` / `apply(f)` | a task: `f(T) -> R`; the flow continues as `R` |
 | `then_accept(f)` | a side effect: `f(T) -> ()`; the context is unchanged |
 | `then_filter(f)` | a gate: `f(T) -> bool` |
-| `.compensate_with(undo)` | declares the task just added compensable, with `undo` as its compensator |
+| `then_apply_compensable(f, undo)` / `apply_compensable(f, undo)` | a compensable task: `undo(Compensation)` runs in the reverse pass if the instance later fails |
 | `Wiggle::all_of((a, b, ..)).combine(f)` | 2–8 arms; `f(A, B, ..)` returns the complete post-join context, and `Step::base()` is the pre-fork context |
 | `Wiggle::all_of_n(vec![..]).combine(f)` | any number of same-typed arms; `f(Vec<T>)` |
-| `Wiggle::one_of(vec![f.when(g).then_apply(..), f.otherwise().then_apply(..)])` | exactly one arm runs; the arms must end at one type (use `.cast::<R>()`) |
+| `Wiggle::one_of(vec![f.when(g).then_apply(..), f.otherwise().then_apply(..)])` | exactly one arm runs; the arms must end at one type (use `.as_type::<R>()`, Java's `as(R.class)`) |
 | `then_for_each(key, \|item\| item.then_apply(..)).combine(f)` | one branch per element; `f(Vec<X>)` (or `combine_map` for a map input) |
 | `repeat_while(cond, \|b\| ..)` / `repeat_while_max(cond, n, \|b\| ..)` | a do-while loop |
 | `then_sleep(d)`, `then_await(signal)`, `then_await_or(signal, d, \|esc\| ..)`, `then_sub_flow::<R>(node, wf)` | timers, signals, sub-workflows |
@@ -270,9 +315,9 @@ Client::connect_with(endpoint, api_key)       // a configured tonic Endpoint (TL
 register(&spec) / register_force(&spec)       -> RegisterResult
 get_workflow(name) / get_workflow_version(name, v) / workflow_names()
 start(workflow, &ctx) / start_with(workflow, &ctx, StartOptions::default().version(2).correlation_id("..."))
-instance(id) / instance_detail(id) / list_instances(wf, status, limit) / find_by_correlation(cid, limit)
+instance(id) / instance_detail(id) -> InstanceWithTokens / list_instances(wf, status, limit) / find_by_correlation(cid, limit)
 await_completion(id, timeout) / cancel(id, reason) / signal(id, name, &payload)
-create_schedule(wf, every, &ctx) / create_cron_schedule(wf, cron, &ctx) / schedules() / delete_schedule(id)
+create_schedule(wf, every, &ctx) / create_cron_schedule(wf, cron, &ctx) / schedules() -> Vec<ScheduleInfo> / delete_schedule(id)
 search(SearchQuery) / backlog_coverage(max) / step_stats(wf, version, since, sample)
 poll_events(consumer, max, wait, start_from) / ack_events(consumer, cursor) / ack_events_seq(consumer, seq)
 health() / cluster()
@@ -282,6 +327,37 @@ health() / cluster()
 `WIGGLE_API_KEY`, when set, is presented on every call as `authorization: Bearer <key>`. Every call
 is retried on `UNAVAILABLE` with exponential backoff (`WIGGLE_RPC_MAX_ATTEMPTS`, default 5;
 `WIGGLE_RPC_RETRY_DELAY_MILLIS`, default 200), so a worker rides out a server restart.
+
+## Java vocabulary
+
+The API uses the Java client's names, in Rust case (`thenApply` → `then_apply`). Where Java
+overloads a method, Rust adds a suffix naming the extra argument; where Java uses reflection, Rust
+binds closures.
+
+| Java | Rust |
+|---|---|
+| `new WiggleClient(target)` | `Client::connect(target)` |
+| `register(spec, true)` | `register_force(&spec)` |
+| `getWorkflow(name, version)` | `get_workflow_version(name, version)` |
+| `start(workflow, ctx, version, correlationId)` | `start_with(workflow, &ctx, StartOptions::default().version(v).correlation_id(c))` |
+| `ackEvents(consumer, long ackedSeq)` | `ack_events_seq(consumer, seq)` |
+| `InstanceWithTokens` / `TokenInfo` / `ScheduleInfo` | same names |
+| `WorkerOptions.defaults().withConcurrency(..)` … | `WorkerOptions::defaults().with_concurrency(..)` … |
+| `worker.registerHandler(handlers)` | `handle` / `effect` / `gate` / `combine` / `compensation`, or `flow(&flow)` |
+| `worker.start()` / `worker.close()` | `start().await` → `RunningWorker`, `close().await` |
+| `GraphBuilder.sleep(name, d)` / `forEach(name, key, body)` | `sleep_named(name, d)` / `for_each_named(name, key, body)` |
+| `awaitSignal(name, timeout[, escalation])` | `await_signal_timeout(..)` / `await_signal_or(..)` |
+| `doWhile(cond, max, body)` | `do_while_max(cond, max, body)` |
+| `FlowSpec.define(name, v, Order.class, f -> ..)` | `Wiggle::define(name, v, \|f: WiggleFlow<Order>\| ..)` |
+| `thenSleep(name, d)` / `thenAwait(signal, timeout[, escalation])` | `then_sleep_named` / `then_await_timeout` / `then_await_or` |
+| `thenForEach(name, key, body)` | `then_for_each_named(name, key, body)` |
+| `repeatWhile(cond, max, body)` | `repeat_while_max(cond, max, body)` |
+| `thenApplyCompensable(factory)` | `then_apply_compensable(step, undo)` |
+| `Wiggle.allOf(a, b, ..)` / `allOf(arms...)` | `Wiggle::all_of((a, b, ..))` / `Wiggle::all_of_n(vec![..])` |
+| `flow.as(R.class)` | `flow.as_type::<R>()` (`as` is a Rust keyword) |
+| `Step.current().attempt()` … | `Step::attempt()` … |
+| `Step.create(key, input)` / `Step.base(Order.class)` | `Step::create_keyed(key, input)` / `Step::base_as::<Order>()` |
+| `PermanentActivityException` | `StepError::permanent(msg)` |
 
 ## Testing
 
@@ -295,7 +371,8 @@ WIGGLE_TEST_URL=localhost:8080 cargo test --test integration  # end-to-end again
 - **Execution mode is SERVER only**: the worker runs one step per claim and hands back
   (no local step chaining / `LOCAL_SYNC` / `LOCAL_ASYNC`).
 - **Not ported from the Java client**: `@ForFlow` handler objects matched by reflection (bind with
-  `handle(..)`, or let a typed flow carry its handlers), step-contract interfaces, run-time branch
-  creation (`Step.create`) and its spawn combine, `Items` accessor references (a forEach names its
-  key as a string), queue criteria polls, and cross-instance batching.
+  `handle(..)`, or let a typed flow carry its handlers), step-contract interfaces, `Items` accessor
+  references (a forEach names its key as a string), `checkpoint` / `attribute` / `executeIn*`,
+  queue criteria polls (`withCriteria`), local batching (`withLocalBatchSize`) and cross-instance
+  batching (`withCrossInstanceBatching`).
 - **Toolchain**: `Cargo.lock` pins a few transitive dependencies so the crate builds on Rust 1.82.

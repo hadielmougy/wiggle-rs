@@ -178,14 +178,14 @@ impl Client {
     }
 
     /// An instance together with its tokens (one per step reached).
-    pub async fn instance_detail(&self, id: &str) -> Result<InstanceDetail> {
+    pub async fn instance_detail(&self, id: &str) -> Result<InstanceWithTokens> {
         let req = pb::InstanceIdRequest { instance_id: id.to_string() };
         let res = self.call("GetInstance", req, |mut s, r| async move { s.get_instance(r).await }).await?;
         let instance = res
             .instance
             .map(InstanceView::from)
             .ok_or_else(|| Error::Invalid(format!("instance {id}: the server sent no instance")))?;
-        Ok(InstanceDetail { instance, tokens: res.tokens.into_iter().map(TokenView::from).collect() })
+        Ok(InstanceWithTokens { instance, tokens: res.tokens.into_iter().map(TokenInfo::from).collect() })
     }
 
     /// Instances, optionally filtered by workflow and/or status.
@@ -286,13 +286,13 @@ impl Client {
     // ---- schedules ----
 
     /// Starts `workflow` with `context` every `every`.
-    pub async fn create_schedule<T: Serialize + ?Sized>(&self, workflow: &str, every: Duration, context: &T) -> Result<ScheduleView> {
+    pub async fn create_schedule<T: Serialize + ?Sized>(&self, workflow: &str, every: Duration, context: &T) -> Result<ScheduleInfo> {
         let cadence = pb::create_schedule_request::Cadence::EveryMillis(every.as_millis() as i64);
         self.schedule(workflow, cadence, context).await
     }
 
     /// Starts `workflow` with `context` on a five-field cron expression, evaluated in UTC.
-    pub async fn create_cron_schedule<T: Serialize + ?Sized>(&self, workflow: &str, cron: &str, context: &T) -> Result<ScheduleView> {
+    pub async fn create_cron_schedule<T: Serialize + ?Sized>(&self, workflow: &str, cron: &str, context: &T) -> Result<ScheduleInfo> {
         let cadence = pb::create_schedule_request::Cadence::Cron(cron.to_string());
         self.schedule(workflow, cadence, context).await
     }
@@ -302,19 +302,19 @@ impl Client {
         workflow: &str,
         cadence: pb::create_schedule_request::Cadence,
         context: &T,
-    ) -> Result<ScheduleView> {
+    ) -> Result<ScheduleInfo> {
         let req = pb::CreateScheduleRequest {
             workflow: workflow.to_string(),
             cadence: Some(cadence),
             context: Some(to_value(&serde_json::to_value(context)?)),
         };
         let res = self.call("CreateSchedule", req, |mut s, r| async move { s.create_schedule(r).await }).await?;
-        Ok(ScheduleView::from(res))
+        Ok(ScheduleInfo::from(res))
     }
 
-    pub async fn schedules(&self) -> Result<Vec<ScheduleView>> {
+    pub async fn schedules(&self) -> Result<Vec<ScheduleInfo>> {
         let res = self.call("ListSchedules", pb::Empty {}, |mut s, r| async move { s.list_schedules(r).await }).await?;
-        Ok(res.schedules.into_iter().map(ScheduleView::from).collect())
+        Ok(res.schedules.into_iter().map(ScheduleInfo::from).collect())
     }
 
     pub async fn delete_schedule(&self, id: &str) -> Result<()> {
@@ -642,7 +642,7 @@ impl From<pb::InstanceView> for InstanceView {
 
 /// One token of an instance: a step reached, with its state and (where recorded) its input/output.
 #[derive(Debug, Clone)]
-pub struct TokenView {
+pub struct TokenInfo {
     pub id: String,
     pub node_id: String,
     pub kind: String,
@@ -659,9 +659,9 @@ pub struct TokenView {
     pub created_at: i64,
 }
 
-impl From<pb::Token> for TokenView {
+impl From<pb::Token> for TokenInfo {
     fn from(t: pb::Token) -> Self {
-        TokenView {
+        TokenInfo {
             input: t.input.as_ref().map(from_value),
             output: t.output.as_ref().map(from_value),
             id: t.id,
@@ -681,9 +681,9 @@ impl From<pb::Token> for TokenView {
 }
 
 #[derive(Debug, Clone)]
-pub struct InstanceDetail {
+pub struct InstanceWithTokens {
     pub instance: InstanceView,
-    pub tokens: Vec<TokenView>,
+    pub tokens: Vec<TokenInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -713,7 +713,7 @@ pub struct ClusterView {
 }
 
 #[derive(Debug, Clone)]
-pub struct ScheduleView {
+pub struct ScheduleInfo {
     pub id: String,
     pub workflow: String,
     /// 0 when cron-based.
@@ -724,9 +724,9 @@ pub struct ScheduleView {
     pub created_at: i64,
 }
 
-impl From<pb::ScheduleView> for ScheduleView {
+impl From<pb::ScheduleView> for ScheduleInfo {
     fn from(s: pb::ScheduleView) -> Self {
-        ScheduleView {
+        ScheduleInfo {
             id: s.id,
             workflow: s.workflow,
             every_millis: s.every_millis,
@@ -930,6 +930,8 @@ pub struct StepReport {
     pub started_at: i64,
     pub finished_at: i64,
     pub events: Vec<EmittedEvent>,
+    /// Branches the step created at run time (`Step::create`), in creation order.
+    pub branches: Vec<pb::CreatedBranch>,
 }
 
 impl StepReport {
@@ -950,7 +952,7 @@ impl StepReport {
                 .into_iter()
                 .map(|e| pb::EmittedEvent { r#type: e.event_type, payload: Some(to_value(&e.payload)) })
                 .collect(),
-            branches: Vec::new(),
+            branches: self.branches,
         }
     }
 }

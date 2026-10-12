@@ -95,6 +95,8 @@ enum Node {
     ForEach { name: String, items_key: String, body: Vec<Node>, combine: WorkerStep },
     Choose { cases: Vec<(Option<WorkerStep>, Vec<Node>)> },
     DoWhile { cond: WorkerStep, budget: i64, body: Vec<Node> },
+    /// The combine of the branches the task before it creates at run time (`Step::create`).
+    SpawnCombine { creator: String, combine: WorkerStep },
 }
 
 #[derive(Debug)]
@@ -282,6 +284,24 @@ impl GraphBuilder {
         self.push(Node::Choose { cases: out })
     }
 
+    /// Makes the task just added a **spawning step** -- its handler may open branches at run time
+    /// with [`Step::create`](crate::Step::create) -- and adds the combine they rejoin at. The
+    /// combine receives the branches' results (a list in creation order, or a map by key) and the
+    /// spawning step's return as [`Step::base`](crate::Step::base); it may itself create branches,
+    /// starting another round. Must directly follow `step()` or `effect()`.
+    pub fn spawn_combine(self, name: impl Into<String>) -> Self {
+        let creator = match self.nodes.last() {
+            Some(Node::Task { step, .. }) => step.name.clone(),
+            _ => {
+                return self.fail(
+                    "spawn_combine() must directly follow the step that creates the branches it combines: \
+                     a step() or effect()",
+                )
+            }
+        };
+        self.push(Node::SpawnCombine { creator, combine: WorkerStep::named(name) })
+    }
+
     /// The queue for the step just added (task, effect, gate, a combine, or a loop's condition). Defaults to the
     /// workflow's default queue.
     pub fn queue(mut self, queue: impl Into<String>) -> Self {
@@ -311,7 +331,7 @@ impl GraphBuilder {
     pub fn compensate(mut self) -> Self {
         match self.nodes.last_mut() {
             Some(Node::Task { compensable, .. }) => *compensable = true,
-            Some(Node::Fork { .. }) | Some(Node::ForEach { .. }) => {
+            Some(Node::Fork { .. }) | Some(Node::ForEach { .. }) | Some(Node::SpawnCombine { .. }) => {
                 return self.fail("compensate() applies to a step or effect, not a combine")
             }
             _ => return self.fail("compensate() must directly follow step() or effect()"),
@@ -345,6 +365,7 @@ impl GraphBuilder {
             Node::Task { step, .. } | Node::Gate { step } => Some(step),
             Node::Fork { combine, .. } | Node::ForEach { combine, .. } => Some(combine),
             Node::DoWhile { cond, .. } => Some(cond),
+            Node::SpawnCombine { combine, .. } => Some(combine),
             _ => None,
         }
     }
@@ -691,6 +712,13 @@ impl Stream {
                 self.open = vec![OpenEnd::next(&combine_id)];
             }
             Node::Choose { cases } => self.choose(g, cases)?,
+            Node::SpawnCombine { creator, combine } => {
+                let join = g.add_join(0);
+                self.attach(g, &join);
+                let combine_id = g.add_worker("TASK", combine)?;
+                g.set(&combine_id, "collectKey", json!(format!("__spawn__{creator}")));
+                self.attach(g, &combine_id);
+            }
             Node::DoWhile { cond, budget, body } => {
                 let what = format!("do_while '{}' body", cond.name);
                 let mut sub = self.sub(g, self.enclosing_join.clone(), body, &what)?;

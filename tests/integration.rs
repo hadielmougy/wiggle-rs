@@ -22,7 +22,7 @@ fn unique(name: &str) -> String {
 }
 
 fn opts() -> WorkerOptions {
-    WorkerOptions::default().long_poll_wait(Duration::from_millis(500))
+    WorkerOptions::defaults().with_long_poll_wait(Duration::from_millis(500))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,7 +83,7 @@ async fn linear_flow_with_gate_effect_and_events() {
     let gated = client.start(&spec, &json!({"orderId": "A-2", "quantity": 0})).await.unwrap();
     let ok = client.await_completion(&ok, Duration::from_secs(30)).await.unwrap();
     let gated = client.await_completion(&gated, Duration::from_secs(30)).await.unwrap();
-    worker.shutdown().await;
+    worker.close().await;
 
     assert_eq!(ok.status, "COMPLETED", "{ok:?}");
     let order: Order = ok.context_as().unwrap();
@@ -155,7 +155,7 @@ async fn fork_and_for_each_combine() {
 
     let id = client.start(&spec, &json!({"xs": [1, 2, 3]})).await.unwrap();
     let view = client.await_completion(&id, Duration::from_secs(30)).await.unwrap();
-    worker.shutdown().await;
+    worker.close().await;
 
     assert_eq!(view.status, "COMPLETED", "{view:?}");
     assert_eq!(view.context["sides"], json!(["L", "R"]));
@@ -198,7 +198,7 @@ async fn failure_runs_compensators() {
 
     let id = client.start(&spec, &json!({})).await.unwrap();
     let view = client.await_completion(&id, Duration::from_secs(30)).await.unwrap();
-    worker.shutdown().await;
+    worker.close().await;
 
     assert_eq!(view.status, "COMPENSATED", "{view:?}");
     assert_eq!(released.load(Ordering::SeqCst), 1);
@@ -309,7 +309,7 @@ mod typed {
         let b = client.start(&flow, &Trip { id: "T2".into(), vip: false, nights: vec![3] }).await.unwrap();
         let a = client.await_completion(&a, Duration::from_secs(30)).await.unwrap();
         let b = client.await_completion(&b, Duration::from_secs(30)).await.unwrap();
-        worker.shutdown().await;
+        worker.close().await;
 
         assert_eq!(a.status, "COMPLETED", "{a:?}");
         assert_eq!(a.context["seat"], "T1-1A");

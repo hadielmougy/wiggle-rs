@@ -20,6 +20,8 @@
 //!   implement its steps (`then_apply`, `then_filter`, [`Wiggle::all_of`]`(..).combine(..)`,
 //!   [`Wiggle::one_of`], ...), checked by the compiler, carrying its handlers for
 //!   [`Worker::flow`].
+//! * [`branch::Branch`] -- run-time branches a step opens with [`Step::create`], Java's
+//!   `worker.Branch` (the topology's fork arm is [`Branch`], Java's `flow.Branch`).
 //! * [`Step`] -- the running step's identity (attempt, instance, forEach base/item index) and
 //!   [`Step::emit`] for domain events, the equivalent of Java's `Step.current()`.
 //!
@@ -59,10 +61,11 @@
 //! let id = client.start(&order, &Order { order_id: "A-1".into(), quantity: 3, status: None }).await?;
 //! let view = client.await_completion(&id, Duration::from_secs(30)).await?;
 //! println!("{} {}", view.status, view.context);
-//! worker.shutdown().await;
+//! worker.close().await;
 //! # Ok(()) }
 //! ```
 
+pub mod branch;
 mod client;
 mod error;
 mod flow;
@@ -77,11 +80,12 @@ pub mod pb {
     tonic::include_proto!("com.wiggle.proto");
 }
 
+pub use branch::{AllOfArms, BranchFork, BranchSteps, OneOfArms};
 pub use client::{
     BacklogCoverage, BacklogSlice, Client, ClusterMember, ClusterView, EmittedEvent, EventView,
-    Health, InstanceDetail, InstanceView, NodeStats, PollResult, RegisterResult, RunApplied,
-    ScheduleView, SearchHit, SearchQuery, SearchResult, StartOptions, StepReport, StepStats, Task,
-    TokenView, WorkflowVersion,
+    Health, InstanceView, InstanceWithTokens, NodeStats, PollResult, RegisterResult, RunApplied,
+    ScheduleInfo, SearchHit, SearchQuery, SearchResult, StartOptions, StepReport, StepStats, Task,
+    TokenInfo, WorkflowVersion,
 };
 pub use error::{Error, Result, StepError};
 pub use flow::{Branch, Case, FlowSpec, ForEachStage, ForkStage, GraphBuilder};

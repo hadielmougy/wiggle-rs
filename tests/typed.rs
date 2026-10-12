@@ -173,8 +173,7 @@ fn for_each_loops_and_compensation() {
         Ok(v)
     }
     let flow = Wiggle::define("basket", 1, |f: wiggle::WiggleFlow<Value>| {
-        f.then_apply(reserve)
-            .compensate_with(release)
+        f.then_apply_compensable(reserve, release)
             .then_for_each("lines", |item| item.then_apply(price))
             .combine(total)
             .repeat_while_max(more, 5, |b| b.then_apply(fetch))

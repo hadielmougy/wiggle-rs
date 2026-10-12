@@ -55,6 +55,8 @@ struct Binding {
     step: String,
     kind: Kind,
     handler: Handler,
+    /// A step created at run time (`Step::create`): in no graph, so bound by name only.
+    created: bool,
 }
 
 impl Binding {
@@ -95,34 +97,39 @@ impl Default for WorkerOptions {
 }
 
 impl WorkerOptions {
+    /// The defaults, like Java's `WorkerOptions.defaults()`.
+    pub fn defaults() -> Self {
+        Self::default()
+    }
+
     /// The most steps in flight at once (default: the number of CPUs).
-    pub fn concurrency(mut self, n: usize) -> Self {
+    pub fn with_concurrency(mut self, n: usize) -> Self {
         self.concurrency = n.max(1);
         self
     }
 
     /// How long a claimed step may run before the server reclaims it (default 30s). A running
     /// step's lease is extended by heartbeats every half lease.
-    pub fn lease(mut self, lease: Duration) -> Self {
+    pub fn with_lease(mut self, lease: Duration) -> Self {
         self.lease = lease;
         self
     }
 
     /// How long a poll waits server-side for work to appear (default 10s).
-    pub fn long_poll_wait(mut self, wait: Duration) -> Self {
+    pub fn with_long_poll_wait(mut self, wait: Duration) -> Self {
         self.long_poll_wait = wait;
         self
     }
 
     /// Restricts the worker to these queues (else it serves every queue its bound steps poll).
-    pub fn queues<S: Into<String>>(mut self, queues: impl IntoIterator<Item = S>) -> Self {
+    pub fn with_queues<S: Into<String>>(mut self, queues: impl IntoIterator<Item = S>) -> Self {
         self.queues = Some(queues.into_iter().map(Into::into).collect());
         self
     }
 
     /// Makes `start` wait up to `wait` for a bound workflow's graph to be registered before failing
     /// -- to ride out a registration race. Zero (the default) fails fast.
-    pub fn await_registration(mut self, wait: Duration) -> Self {
+    pub fn with_await_registration(mut self, wait: Duration) -> Self {
         self.await_registration = wait;
         self
     }
@@ -332,8 +339,12 @@ impl Worker {
         self
     }
 
-    fn bind(mut self, workflow: &str, step: &str, kind: Kind, handler: Handler) -> Self {
-        let binding = Binding { workflow: workflow.to_string(), step: step.to_string(), kind, handler };
+    fn bind(self, workflow: &str, step: &str, kind: Kind, handler: Handler) -> Self {
+        self.bind_as(workflow, step, kind, handler, false)
+    }
+
+    fn bind_as(mut self, workflow: &str, step: &str, kind: Kind, handler: Handler, created: bool) -> Self {
+        let binding = Binding { workflow: workflow.to_string(), step: step.to_string(), kind, handler, created };
         let activity = binding.activity();
         if self.bindings.iter().any(|b| b.activity() == activity) && self.error.is_none() {
             self.error = Some(format!("duplicate handler for activity '{activity}'"));
@@ -411,6 +422,27 @@ impl Worker {
         self
     }
 
+    /// Binds the handlers of steps that `workflow`'s branches run -- steps a handler chains onto
+    /// [`Step::create`](crate::Step::create), which are in no graph. They are not reconciled at
+    /// `start`; a created step whose handler does not fit its kind fails when it is dispatched.
+    /// A branch step on a queue of its own runs only on workers that list that queue in
+    /// [`WorkerOptions::with_queues`].
+    pub fn branch_steps(mut self, workflow: &str, steps: crate::branch::BranchSteps) -> Self {
+        match steps.into_bindings() {
+            Ok(bindings) => {
+                for b in bindings {
+                    self = self.bind_as(workflow, &b.step, b.kind, b.handler, true);
+                }
+            }
+            Err(e) => {
+                if self.error.is_none() {
+                    self.error = Some(e);
+                }
+            }
+        }
+        self
+    }
+
     /// Reconciles every binding against its registered graph -- a mistyped step name, a kind
     /// mismatch or a missing compensator fails here -- then starts polling.
     pub async fn start(self) -> Result<RunningWorker> {
@@ -421,7 +453,8 @@ impl Worker {
             return Err(Error::Registration(format!("worker {} binds no handlers", self.id)));
         }
         let mut graphs = HashMap::new();
-        for workflow in self.bindings.iter().map(|b| b.workflow.clone()).collect::<BTreeSet<_>>() {
+        let graph_bound = self.bindings.iter().filter(|b| !b.created).map(|b| b.workflow.clone());
+        for workflow in graph_bound.collect::<BTreeSet<_>>() {
             let graph = fetch_graph(&self.client, &workflow, self.options.await_registration).await?;
             graphs.insert(workflow, graph);
         }
@@ -430,10 +463,19 @@ impl Worker {
             Some(only) => only.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect(),
             None => learned.into_iter().collect(),
         };
+        if queues.is_empty() {
+            return Err(Error::Registration(format!(
+                "worker {} has no queue to poll: it binds only branch steps, so list their queues in \
+                 WorkerOptions::with_queues",
+                self.id
+            )));
+        }
+        let spawners = graphs.values().map(spawners).collect();
         let handlers: HashMap<String, (Kind, Handler)> =
             self.bindings.into_iter().map(|b| (b.activity(), (b.kind, b.handler))).collect();
 
-        let inner = Arc::new(Inner { client: self.client, id: self.id, options: self.options, queues, handlers });
+        let inner =
+            Arc::new(Inner { client: self.client, id: self.id, options: self.options, queues, handlers, spawners });
         let cancel = CancellationToken::new();
         log::info!(
             "wiggle: worker {} polling queues {:?} (concurrency {})",
@@ -446,7 +488,7 @@ impl Worker {
     }
 }
 
-/// A started worker. [`shutdown`](Self::shutdown) stops polling and waits for in-flight steps;
+/// A started worker. [`close`](Self::close) stops polling and waits for in-flight steps;
 /// dropping it stops polling without waiting.
 pub struct RunningWorker {
     inner: Arc<Inner>,
@@ -465,7 +507,7 @@ impl RunningWorker {
     }
 
     /// Stops polling and waits for the in-flight steps to finish and report.
-    pub async fn shutdown(mut self) {
+    pub async fn close(mut self) {
         self.cancel.cancel();
         if let Some(join) = self.join.take() {
             let _ = join.await;
@@ -485,6 +527,59 @@ struct Inner {
     options: WorkerOptions,
     queues: Vec<String>,
     handlers: HashMap<String, (Kind, Handler)>,
+    /// Per (workflow, version) of a graph this worker holds: the nodes that may create branches.
+    spawners: HashMap<(String, i64), HashSet<String>>,
+}
+
+impl Inner {
+    /// Whether the task's step may call `Step::create`. Without its node in a graph this worker
+    /// holds -- another version, or a node a branch created -- the server is the one to refuse.
+    fn may_create(&self, task: &Task) -> bool {
+        if task.node_id.starts_with('~') {
+            return true;
+        }
+        match self.spawners.get(&(task.workflow.clone(), i64::from(task.version))) {
+            Some(nodes) => nodes.contains(&task.node_id),
+            None => true,
+        }
+    }
+}
+
+/// The nodes of a graph that may create branches: a spawn combine, and the task directly before
+/// one (task -> dynamic JOIN -> combine collecting under `__spawn__<task name>`).
+fn spawners(graph: &Value) -> ((String, i64), HashSet<String>) {
+    let key = (
+        graph.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+        graph.get("version").and_then(Value::as_i64).unwrap_or(0),
+    );
+    let nodes: HashMap<&str, &Map<String, Value>> = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter_map(|n| n.get("id").and_then(Value::as_str).map(|id| (id, n)))
+        .collect();
+    let spawn_key = |n: &Map<String, Value>| n.get("collectKey").and_then(Value::as_str).filter(|k| k.starts_with("__spawn__")).map(str::to_string);
+    let mut out = HashSet::new();
+    for (id, node) in &nodes {
+        if spawn_key(node).is_some() {
+            out.insert(id.to_string());
+            continue;
+        }
+        if str_of(node, "kind") != "TASK" || is_combine(node) {
+            continue;
+        }
+        let join = node.get("next").and_then(Value::as_str).and_then(|n| nodes.get(n));
+        let combine = join
+            .filter(|j| str_of(j, "kind") == "JOIN" && j.get("expected").and_then(Value::as_i64).unwrap_or(0) == 0)
+            .and_then(|j| j.get("next").and_then(Value::as_str))
+            .and_then(|c| nodes.get(c));
+        if combine.and_then(|c| spawn_key(c)) == Some(format!("__spawn__{}", str_of(node, "name"))) {
+            out.insert(id.to_string());
+        }
+    }
+    (key, out)
 }
 
 async fn fetch_graph(client: &Client, workflow: &str, await_registration: Duration) -> Result<Value> {
@@ -517,7 +612,7 @@ fn reconcile(bindings: &[Binding], graphs: &HashMap<String, Value>) -> std::resu
             .filter(|n| matches!(str_of(n, "kind"), "TASK" | "PREDICATE"))
             .filter_map(|n| n.get("name").and_then(Value::as_str).map(|name| (name.to_string(), n)))
             .collect();
-        let bound: Vec<&Binding> = bindings.iter().filter(|b| &b.workflow == workflow).collect();
+        let bound: Vec<&Binding> = bindings.iter().filter(|b| &b.workflow == workflow && !b.created).collect();
         for b in &bound {
             let node = nodes.get(&b.step).ok_or_else(|| {
                 format!(
@@ -648,9 +743,36 @@ async fn execute(w: &Inner, task: Task) {
         fail(w, &task, &format!("no handler registered for activity '{}'", task.activity), false).await;
         return;
     };
+    if task.node_id.starts_with('~') {
+        // A created node is in no graph, so its binding was never reconciled: check it now.
+        let expected = if task.activity.ends_with(COMPENSATE_SUFFIX) {
+            Kind::Compensate
+        } else if task.kind == "PREDICATE" {
+            Kind::Gate
+        } else if task.collect_key.is_some() || !task.arm_names.is_empty() {
+            Kind::Combine
+        } else {
+            Kind::Task
+        };
+        if kind != expected {
+            let msg = format!(
+                "created step '{}' is a {} but its handler is bound with {}; use BranchSteps::{}",
+                task.step_name,
+                describe(expected),
+                kind.verb(),
+                match expected {
+                    Kind::Gate => "gate",
+                    Kind::Combine => "combine",
+                    Kind::Compensate => "compensation",
+                    Kind::Task => "handle",
+                }
+            );
+            return fail(w, &task, &msg, false).await;
+        }
+    }
     let heartbeat = start_heartbeat(w, &task);
     let started = now_millis();
-    let scope = Scope::of(&task);
+    let scope = Scope::of(&task, w.may_create(&task));
     let run = {
         let scope = scope.clone();
         let task = task.clone();
@@ -668,11 +790,16 @@ async fn execute(w: &Inner, task: Task) {
             return fail(w, &task, msg, true).await;
         }
     };
+    let branches = match scope.drain_created() {
+        Ok(b) => b,
+        Err(e) => return fail(w, &task, &e, false).await,
+    };
     let mut report = StepReport {
         node_id: task.node_id.clone(),
         started_at: started,
         finished_at: finished,
         events: scope.drain(),
+        branches,
         ..Default::default()
     };
     match (task.kind.as_str(), outcome) {
@@ -729,7 +856,7 @@ mod tests {
 
     fn binding(step: &str, kind: Kind) -> Binding {
         let handler: Handler = Arc::new(|_| Box::pin(async { Ok(Outcome::Merge(None)) }));
-        Binding { workflow: "order".into(), step: step.into(), kind, handler }
+        Binding { workflow: "order".into(), step: step.into(), kind, handler, created: false }
     }
 
     fn graphs() -> HashMap<String, Value> {

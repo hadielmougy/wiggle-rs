@@ -71,6 +71,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let view = client.await_completion(&id, Duration::from_secs(30)).await?;
     println!("{} {}", view.status, view.context);
 
-    worker.shutdown().await;
+    worker.close().await;
     Ok(())
 }
